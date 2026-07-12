@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#a78f63" />
+    <title>Formicarium — A Living Study</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main id="world" aria-label="Interactive ant colony observation">
+      <canvas id="scene"></canvas>
+      <div class="atmosphere" aria-hidden="true"></div>
+      <section id="intro" aria-live="polite">
+        <p class="eyebrow">A LIVING STUDY</p>
+        <h1>FORMICARIUM</h1>
+        <p class="hint">click an ant to follow · WASD wander · B above/below · [ ] time · R rain</p>
+      </section>
+      <aside id="ant-note" hidden aria-live="polite">
+        <p class="note-kicker">FIELD NOTE</p>
+        <h2 id="ant-note-title">Worker A001</h2>
+        <p id="ant-note-task" class="note-task">exploring</p>
+        <dl id="ant-note-facts"></dl>
+        <p class="note-release">Esc to release</p>
+      </aside>
+      <div id="speed-indicator" aria-live="polite">TIME ×1</div>
+    </main>
+    <script type="module" src="./main.js?v=20260712-phase-2-excavation"></script>
+  </body>
+</html>
