@@ -451,6 +451,212 @@ function createColonyPheromoneField(colonyId, lateralSpread = 0.18) {
 const homePheromoneField = createColonyPheromoneField(HOME_COLONY_ID, 0.18);
 const rivalPheromoneField = createColonyPheromoneField(RIVAL_COLONY_ID, 0.16);
 
+const colonyForagingNetworks = new Map();
+const FORAGING_SECTOR_COUNT = 12;
+
+function createForagingNetwork(colonyId, nest, color) {
+  const network = {
+    colonyId,
+    nest,
+    color,
+    sectors: Array.from({ length: FORAGING_SECTOR_COUNT }, (_, id) => ({
+      id,
+      angle: (id / FORAGING_SECTOR_COUNT) * Math.PI * 2,
+      confidence: 0.04,
+      socialPulse: 0,
+      successes: 0,
+      failures: 0,
+      discoveries: 0,
+      activeForagers: 0,
+      centroidX: nest.x,
+      centroidZ: nest.y,
+      lastSuccessAt: null,
+      trunkStrength: 0,
+    })),
+    routeSwitches: 0,
+    learningWalksCompleted: 0,
+    memoryGuidedSteps: 0,
+    socialGuidedSteps: 0,
+  };
+  colonyForagingNetworks.set(colonyId, network);
+  return network;
+}
+
+const homeForagingNetwork = createForagingNetwork(HOME_COLONY_ID, NEST, 0xe2ad6a);
+const rivalForagingNetwork = createForagingNetwork(RIVAL_COLONY_ID, RIVAL_NEST, 0x79a8bd);
+
+function sectorForPoint(network, x, z) {
+  const angle = (Math.atan2(z - network.nest.y, x - network.nest.x) + Math.PI * 2) % (Math.PI * 2);
+  return Math.round(angle / (Math.PI * 2) * FORAGING_SECTOR_COUNT) % FORAGING_SECTOR_COUNT;
+}
+
+function ensureWorkerNavigation(worker, experienced = false) {
+  worker.navigation ||= {
+    sectorId: null,
+    confidence: experienced ? rand(0.22, 0.58) : 0,
+    rememberedX: null,
+    rememberedZ: null,
+    successfulTrips: 0,
+    failedSearches: 0,
+    searchTime: 0,
+    learningWalk: experienced ? 1 : 0,
+    guidance: experienced ? 'mixed' : 'learning walk',
+  };
+  return worker.navigation;
+}
+
+function chooseForagingSector(worker, network, forceSwitch = false) {
+  const navigation = ensureWorkerNavigation(worker);
+  if (!forceSwitch && navigation.sectorId != null) return network.sectors[navigation.sectorId];
+  let best = null;
+  let bestScore = -Infinity;
+  for (const sector of network.sectors) {
+    const privateFamiliarity = navigation.sectorId === sector.id ? navigation.confidence * 1.8 : 0;
+    const score = sector.socialPulse * 1.5 + sector.confidence * 0.85 + sector.trunkStrength * 0.7
+      + privateFamiliarity - sector.failures * 0.035 + rand(-0.18, 0.18);
+    if (score > bestScore) { bestScore = score; best = sector; }
+  }
+  if (navigation.sectorId != null && best && navigation.sectorId !== best.id) network.routeSwitches++;
+  navigation.sectorId = best?.id ?? 0;
+  navigation.failedSearches = 0;
+  navigation.searchTime = 0;
+  return best || network.sectors[0];
+}
+
+function recordFoodDiscovery(worker, food) {
+  const network = colonyForagingNetworks.get(worker.colonyId);
+  if (!network) return;
+  const navigation = ensureWorkerNavigation(worker);
+  const sectorId = sectorForPoint(network, food.x, food.z);
+  const sector = network.sectors[sectorId];
+  navigation.sectorId = sectorId;
+  navigation.rememberedX = food.x;
+  navigation.rememberedZ = food.z;
+  navigation.confidence = clamp(navigation.confidence + 0.18 * food.nutrition, 0, 1);
+  navigation.searchTime = 0;
+  navigation.failedSearches = 0;
+  sector.discoveries++;
+  const weight = Math.min(8, sector.discoveries);
+  sector.centroidX += (food.x - sector.centroidX) / weight;
+  sector.centroidZ += (food.z - sector.centroidZ) / weight;
+  sector.confidence = clamp(sector.confidence + 0.035 * food.nutrition, 0, 1);
+}
+
+function recordForagingDelivery(worker) {
+  const network = colonyForagingNetworks.get(worker.colonyId);
+  const navigation = ensureWorkerNavigation(worker);
+  if (!network || navigation.sectorId == null) return;
+  const sector = network.sectors[navigation.sectorId];
+  navigation.successfulTrips++;
+  navigation.confidence = clamp(navigation.confidence + 0.12, 0, 1);
+  sector.successes++;
+  sector.socialPulse = clamp(sector.socialPulse + 0.2 + (worker.carryingNutrition || 1) * 0.06, 0, 1.6);
+  sector.confidence = clamp(sector.confidence + 0.055, 0, 1);
+  sector.trunkStrength = clamp(sector.trunkStrength + 0.045, 0, 1);
+  sector.lastSuccessAt = simTime;
+}
+
+function recordForagingFailure(worker) {
+  const network = colonyForagingNetworks.get(worker.colonyId);
+  const navigation = ensureWorkerNavigation(worker);
+  if (!network || navigation.sectorId == null) return;
+  const sector = network.sectors[navigation.sectorId];
+  navigation.failedSearches++;
+  navigation.confidence = Math.max(0, navigation.confidence - 0.13);
+  sector.failures++;
+  sector.confidence = Math.max(0.02, sector.confidence - 0.035);
+  sector.trunkStrength = Math.max(0, sector.trunkStrength - 0.025);
+  if (navigation.failedSearches >= 2 || navigation.confidence < 0.12) chooseForagingSector(worker, network, true);
+}
+
+function sectorTarget(network, sector) {
+  if (sector.discoveries > 0) return { x: sector.centroidX, z: sector.centroidZ };
+  const radius = 7.5 + (sector.id % 3) * 1.4;
+  return { x: network.nest.x + Math.cos(sector.angle) * radius, z: network.nest.y + Math.sin(sector.angle) * radius };
+}
+
+const trunkRouteVisualPool = Array.from({ length: 24 }, () => {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const material = new THREE.LineBasicMaterial({ color: 0xe0af72, transparent: true, opacity: 0, depthWrite: false });
+  const line = new THREE.Line(geometry, material);
+  line.frustumCulled = false;
+  line.visible = false;
+  line.renderOrder = 4;
+  surfaceGroup.add(line);
+  return line;
+});
+
+const trunkMarkerGeometry = new THREE.CircleGeometry(0.11, 10);
+const trunkRouteMarkerPool = Array.from({ length: 144 }, () => {
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xe0af72,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+  });
+  const marker = new THREE.Mesh(trunkMarkerGeometry, material);
+  marker.rotation.x = -Math.PI / 2;
+  marker.visible = false;
+  marker.renderOrder = 3;
+  surfaceGroup.add(marker);
+  return marker;
+});
+
+function updateForagingNetworks(dt) {
+  let routeVisual = 0;
+  let routeMarker = 0;
+  for (const network of colonyForagingNetworks.values()) {
+    for (const sector of network.sectors) {
+      sector.socialPulse = Math.max(0, sector.socialPulse - dt * (0.025 + weather.rain * 0.03));
+      sector.trunkStrength = Math.max(0, sector.trunkStrength - dt * (0.0012 + weather.rain * 0.0025));
+      sector.confidence = Math.max(0.02, sector.confidence - dt * 0.00055);
+      sector.activeForagers = 0;
+    }
+    const colony = getColony(network.colonyId);
+    if (colony) for (const worker of colony.workers) {
+      if (!worker.alive || worker.insideNest) continue;
+      const navigation = ensureWorkerNavigation(worker, worker.generation === 0);
+      if (navigation.sectorId != null) network.sectors[navigation.sectorId].activeForagers++;
+    }
+    const trunks = network.sectors.filter((sector) => sector.successes >= 2 && sector.trunkStrength > 0.08)
+      .sort((a, b) => b.trunkStrength - a.trunkStrength).slice(0, 3);
+    for (const sector of trunks) {
+      if (routeVisual >= trunkRouteVisualPool.length) break;
+      const line = trunkRouteVisualPool[routeVisual++];
+      const target = sectorTarget(network, sector);
+      const bendX = (network.nest.x + target.x) * 0.5 + Math.sin(sector.angle) * 0.45;
+      const bendZ = (network.nest.y + target.z) * 0.5 - Math.cos(sector.angle) * 0.45;
+      const positions = line.geometry.attributes.position.array;
+      positions.set([
+        network.nest.x, groundHeight(network.nest.x, network.nest.y) + 0.055, network.nest.y,
+        bendX, groundHeight(bendX, bendZ) + 0.055, bendZ,
+        target.x, groundHeight(target.x, target.z) + 0.055, target.z,
+      ]);
+      line.geometry.attributes.position.needsUpdate = true;
+      line.material.color.setHex(network.color);
+      line.material.opacity = 0.12 + sector.trunkStrength * 0.42;
+      line.visible = true;
+      for (let markerIndex = 1; markerIndex <= 6 && routeMarker < trunkRouteMarkerPool.length; markerIndex++) {
+        const t = markerIndex / 7;
+        const inverse = 1 - t;
+        const x = inverse * inverse * network.nest.x + 2 * inverse * t * bendX + t * t * target.x;
+        const z = inverse * inverse * network.nest.y + 2 * inverse * t * bendZ + t * t * target.z;
+        const marker = trunkRouteMarkerPool[routeMarker++];
+        marker.position.set(x, groundHeight(x, z) + 0.047, z);
+        marker.material.color.setHex(network.color);
+        marker.material.opacity = 0.07 + sector.trunkStrength * 0.17;
+        marker.scale.setScalar(0.74 + sector.trunkStrength * 0.48);
+        marker.visible = true;
+      }
+    }
+  }
+  for (let i = routeVisual; i < trunkRouteVisualPool.length; i++) trunkRouteVisualPool[i].visible = false;
+  for (let i = routeMarker; i < trunkRouteMarkerPool.length; i++) trunkRouteMarkerPool[i].visible = false;
+}
+
 function pherIndex(x, z) {
   const gx = clamp(Math.floor(((x + HALF_W) / WORLD_W) * PHER_W), 0, PHER_W - 1);
   const gz = clamp(Math.floor(((z + HALF_D) / WORLD_D) * PHER_H), 0, PHER_H - 1);
@@ -499,6 +705,7 @@ function updatePheromones(dt) {
 
 const foods = [];
 const signals = [];
+let simTime = 0;
 let delivered = 0;
 let storedFood = 118;
 const FOOD_NUTRITION = { crumb: 0.72, seed: 1.0, berry: 1.28, beetle: 1.55 };
@@ -522,20 +729,391 @@ cameraRig.focusedColonyId = requestedNestFocus === 'rival' || requestedNestFocus
   ? RIVAL_COLONY_ID
   : HOME_COLONY_ID;
 
-function addFood(x, z, kind = 'crumb', amount = 52, size = 1.5) {
+function addFood(x, z, kind = 'crumb', amount = 52, size = 1.5, ecology = {}) {
   x = clamp(x, -HALF_W + 0.8, HALF_W - 0.8);
   z = clamp(z, -HALF_D + 0.8, HALF_D - 0.8);
   const mesh = makeProp(kind, x, z, size, rand(0, Math.PI * 2));
-  const food = { x, z, kind, amount, initial: amount, size, mesh, nutrition: FOOD_NUTRITION[kind] || 0.8 };
+  const food = {
+    x, z, kind, amount, initial: amount, size, mesh,
+    nutrition: FOOD_NUTRITION[kind] || 0.8,
+    createdAt: simTime,
+    ecologySource: ecology.source || 'incidental',
+    sourcePlantId: ecology.sourcePlantId || null,
+    seedSpecies: ecology.seedSpecies || null,
+    sourceColonyId: ecology.sourceColonyId || null,
+  };
   foods.push(food);
   createSignal(x, z, kind === 'beetle' ? 0xb77c4c : 0xf4d278);
   return food;
+}
+
+function removeFoodUnits(food, amount = 1, cause = 'ant harvest') {
+  if (!food || food.amount <= 0) return 0;
+  const removed = Math.min(food.amount, amount);
+  food.amount -= removed;
+  food.mesh.scale.setScalar(Math.max(0.24, Math.sqrt(food.amount / food.initial)));
+  if (food.kind === 'seed' && food.sourcePlantId) {
+    const plant = vegetationEcology.plants.find((item) => item.id === food.sourcePlantId);
+    if (plant) {
+      if (cause === 'ant harvest') plant.seedsHarvested += removed;
+      else plant.seedsLost += removed;
+    }
+    if (cause === 'ant harvest') vegetationEcology.stats.seedsHarvested += removed;
+    else vegetationEcology.stats.seedsLostToWildlife += removed;
+  }
+  if (food.amount <= 0) {
+    food.amount = 0;
+    food.mesh.visible = false;
+    createSignal(food.x, food.z, cause === 'ant harvest' ? 0x9f9a58 : 0x88483d);
+  }
+  return removed;
 }
 
 addFood(7.4, -4.8, 'seed', 62, 1.55);
 addFood(4.7, 5.4, 'crumb', 78, 1.75);
 addFood(-1.2, 7.6, 'beetle', 115, 2.05);
 addFood(11.7, 5.4, 'berry', 90, 1.8);
+
+// ---------- renewable seed landscape and colony granaries ----------
+const PLANT_PROFILES = {
+  needlegrass: { label: 'needlegrass', foliage: 0x6f7f3e, dry: 0xa89051, seed: 0xd9bd68, maxCrop: 24 },
+  desertForb: { label: 'desert forb', foliage: 0x748548, dry: 0x9a8150, seed: 0xd7a95e, maxCrop: 19 },
+  saltbush: { label: 'saltbush', foliage: 0x788572, dry: 0x93856a, seed: 0xcbb879, maxCrop: 28 },
+};
+const MAX_SEED_PLANTS = 38;
+const vegetationEcology = {
+  plants: [],
+  soilSeeds: [],
+  nextPlantId: 1,
+  nextSoilSeedId: 1,
+  stats: {
+    seedsProduced: 0,
+    seedsHarvested: 0,
+    seedsReturnedToSoil: 0,
+    seedsLostToWildlife: 0,
+    antDispersedSeeds: 0,
+    antDispersedGerminations: 0,
+    germinations: 0,
+    plantDeaths: 0,
+  },
+};
+const colonySeedBanks = new Map();
+
+function createColonySeedBank(colonyId, initialSeeds = 0) {
+  const capacity = colonyId === HOME_COLONY_ID ? 140 : colonyId === RIVAL_COLONY_ID ? 110 : 46;
+  const bank = {
+    colonyId,
+    capacity,
+    current: initialSeeds,
+    totalStored: initialSeeds,
+    consumed: 0,
+    dispersed: 0,
+    sproutedInStore: 0,
+    overflowDiscarded: 0,
+    discardClock: rand(16, 30),
+    wetSproutProgress: 0,
+    species: {},
+  };
+  colonySeedBanks.set(colonyId, bank);
+  return bank;
+}
+
+const homeSeedBank = createColonySeedBank(HOME_COLONY_ID, 24);
+const rivalSeedBank = createColonySeedBank(RIVAL_COLONY_ID, 17);
+
+function storeSeedCargo(colonyId, cargo) {
+  if (cargo?.kind !== 'seed') return;
+  const bank = colonySeedBanks.get(colonyId) || createColonySeedBank(colonyId);
+  const species = cargo.seedSpecies || 'mixed wild seed';
+  if (bank.current >= bank.capacity) {
+    const colony = getColony(colonyId);
+    bank.overflowDiscarded += 1;
+    bank.dispersed += 1;
+    vegetationEcology.stats.antDispersedSeeds += 1;
+    if (colony) {
+      const angle = rand(0, Math.PI * 2);
+      const radius = rand(3.1, 5.7);
+      addSoilSeedCohort(
+        colony.nest.x + Math.cos(angle) * radius,
+        colony.nest.y + Math.sin(angle) * radius * 0.82,
+        species, 1,
+        { viability: rand(0.56, 0.9), dispersedByColonyId: colonyId, progress: rand(0.14, 0.58) },
+      );
+    }
+    return;
+  }
+  bank.current += 1;
+  bank.totalStored += 1;
+  bank.species[species] = (bank.species[species] || 0) + 1;
+}
+
+const plantStemGeometry = new THREE.CylinderGeometry(0.026, 0.04, 1, 5);
+plantStemGeometry.translate(0, 0.5, 0);
+const plantLeafGeometry = new THREE.ConeGeometry(0.075, 0.62, 4);
+plantLeafGeometry.translate(0, 0.31, 0);
+const plantSeedGeometry = new THREE.IcosahedronGeometry(0.075, 0);
+const shrubGeometry = new THREE.IcosahedronGeometry(0.38, 1);
+
+function makeSeedPlantVisual(species) {
+  const profile = PLANT_PROFILES[species];
+  const group = new THREE.Group();
+  const foliageMaterial = new THREE.MeshStandardMaterial({ color: profile.foliage, roughness: 0.96, flatShading: true });
+  const stemMaterial = new THREE.MeshStandardMaterial({ color: 0x655338, roughness: 1, flatShading: true });
+  const seedMaterial = new THREE.MeshStandardMaterial({ color: profile.seed, roughness: 0.9, flatShading: true });
+  const seedHeads = [];
+  if (species === 'needlegrass') {
+    for (let i = 0; i < 6; i++) {
+      const angle = i * 2.399;
+      const stem = new THREE.Mesh(plantStemGeometry, foliageMaterial);
+      stem.position.set(Math.cos(angle) * 0.08, 0, Math.sin(angle) * 0.08);
+      stem.rotation.z = rand(-0.13, 0.13);
+      stem.rotation.x = rand(-0.1, 0.1);
+      stem.scale.set(0.65, rand(0.72, 1.16), 0.65);
+      const head = new THREE.Mesh(plantSeedGeometry, seedMaterial);
+      head.position.set(stem.position.x, stem.scale.y + 0.04, stem.position.z);
+      head.scale.set(0.65, 1.7, 0.65);
+      group.add(stem, head);
+      seedHeads.push(head);
+    }
+  } else if (species === 'desertForb') {
+    for (let i = 0; i < 4; i++) {
+      const angle = i * Math.PI * 0.5 + 0.35;
+      const stem = new THREE.Mesh(plantStemGeometry, stemMaterial);
+      stem.position.set(Math.cos(angle) * 0.11, 0, Math.sin(angle) * 0.11);
+      stem.scale.set(0.8, 0.62 + i * 0.06, 0.8);
+      const leaf = new THREE.Mesh(plantLeafGeometry, foliageMaterial);
+      leaf.position.set(Math.cos(angle) * 0.18, 0.05, Math.sin(angle) * 0.18);
+      leaf.rotation.z = Math.cos(angle) * 0.72;
+      leaf.rotation.x = Math.sin(angle) * 0.72;
+      leaf.scale.set(1.15, 0.68, 1.15);
+      const head = new THREE.Mesh(plantSeedGeometry, seedMaterial);
+      head.position.set(stem.position.x, stem.scale.y + 0.08, stem.position.z);
+      head.scale.set(1.25, 0.52, 1.25);
+      group.add(stem, leaf, head);
+      seedHeads.push(head);
+    }
+  } else {
+    const trunk = new THREE.Mesh(plantStemGeometry, stemMaterial);
+    trunk.scale.set(1.25, 0.7, 1.25);
+    group.add(trunk);
+    for (let i = 0; i < 5; i++) {
+      const angle = i * 2.399;
+      const foliage = new THREE.Mesh(shrubGeometry, foliageMaterial);
+      foliage.position.set(Math.cos(angle) * 0.28, 0.34 + (i % 2) * 0.18, Math.sin(angle) * 0.24);
+      foliage.scale.set(1, 0.62, 0.86);
+      const head = new THREE.Mesh(plantSeedGeometry, seedMaterial);
+      head.position.copy(foliage.position).add(new THREE.Vector3(Math.cos(angle) * 0.14, 0.17, Math.sin(angle) * 0.14));
+      group.add(foliage, head);
+      seedHeads.push(head);
+    }
+  }
+  group.traverse((child) => {
+    if (!child.isMesh) return;
+    child.castShadow = true;
+    child.receiveShadow = true;
+  });
+  surfaceGroup.add(group);
+  return { group, foliageMaterial, seedMaterial, seedHeads };
+}
+
+function plantSpotClear(x, z, minimum = 1.15) {
+  if (Math.hypot(x - NEST.x, z - NEST.y) < 2.1 || Math.hypot(x - RIVAL_NEST.x, z - RIVAL_NEST.y) < 2.1) return false;
+  return vegetationEcology.plants.every((plant) => !plant.alive || Math.hypot(x - plant.x, z - plant.z) >= minimum);
+}
+
+function createSeedPlant(x, z, species = 'needlegrass', maturity = 0.7, dispersedByColonyId = null) {
+  if (vegetationEcology.plants.filter((plant) => plant.alive).length >= MAX_SEED_PLANTS || !plantSpotClear(x, z)) return null;
+  const visual = makeSeedPlantVisual(species);
+  const plant = {
+    id: `plant-${String(vegetationEcology.nextPlantId++).padStart(3, '0')}`,
+    species,
+    x, z,
+    maturity: clamp(maturity, 0.05, 1),
+    health: rand(0.82, 1),
+    alive: true,
+    phenology: 'growing',
+    cropFoodId: null,
+    producedSeasonKey: -1,
+    seedsProduced: 0,
+    seedsHarvested: 0,
+    seedsLost: 0,
+    dispersedByColonyId,
+    lastWinterCheck: -1,
+    visual,
+  };
+  alignToGround(visual.group, x, z, rand(0, Math.PI * 2), 0.015);
+  vegetationEcology.plants.push(plant);
+  return plant;
+}
+
+function addSoilSeedCohort(x, z, species, count = 1, source = {}) {
+  if (count <= 0 || vegetationEcology.soilSeeds.length >= 90) return null;
+  const cohort = {
+    id: `soil-seed-${vegetationEcology.nextSoilSeedId++}`,
+    x: clamp(x, -HALF_W + 0.8, HALF_W - 0.8),
+    z: clamp(z, -HALF_D + 0.8, HALF_D - 0.8),
+    species: PLANT_PROFILES[species] ? species : 'needlegrass',
+    count,
+    viability: source.viability ?? rand(0.58, 0.96),
+    germinationProgress: source.progress ?? rand(0, 0.58),
+    depositedAt: simTime,
+    sourcePlantId: source.sourcePlantId || null,
+    dispersedByColonyId: source.dispersedByColonyId || null,
+  };
+  vegetationEcology.soilSeeds.push(cohort);
+  vegetationEcology.stats.seedsReturnedToSoil += count;
+  return cohort;
+}
+
+function plantSeedWindow(plant) {
+  const season = environment.season.name;
+  if (plant.species === 'needlegrass') return season === 'spring' && environment.seasonProgress > 0.48 || season === 'summer' && environment.seasonProgress < 0.32;
+  if (plant.species === 'desertForb') return season === 'summer' && environment.seasonProgress > 0.18;
+  return season === 'autumn' && environment.seasonProgress > 0.08;
+}
+
+function updateSeedPlantVisual(plant) {
+  const { visual } = plant;
+  const season = environment.season.name;
+  const growing = season === 'spring' || season === 'summer';
+  const speciesScale = plant.species === 'saltbush' ? 0.68 : plant.species === 'desertForb' ? 0.86 : 1;
+  const scale = (0.34 + plant.maturity * 0.72) * speciesScale;
+  visual.group.scale.set(scale, scale * (season === 'winter' ? 0.72 : 1), scale);
+  visual.group.visible = plant.alive;
+  const hasCrop = foods.some((food) => food.sourcePlantId === plant.id && food.amount > 0);
+  for (const head of visual.seedHeads) head.visible = plantSeedWindow(plant) || hasCrop || season === 'autumn';
+  visual.foliageMaterial.color.setHex(growing ? PLANT_PROFILES[plant.species].foliage : PLANT_PROFILES[plant.species].dry);
+  visual.foliageMaterial.color.multiplyScalar(0.76 + plant.health * 0.24);
+  visual.seedMaterial.color.setHex(PLANT_PROFILES[plant.species].seed);
+}
+
+function updateColonySeedBanks(dt) {
+  for (const bank of colonySeedBanks.values()) {
+    const colony = getColony(bank.colonyId);
+    if (!colony || colony.status === 'extinct') continue;
+    const consumption = Math.min(bank.current, dt * colony.workers.length * (environment.season.name === 'winter' ? 0.00024 : 0.00016));
+    bank.current -= consumption;
+    bank.consumed += consumption;
+    bank.discardClock -= dt;
+    const humidity = weather.postRainHumidity + weather.rain * 0.9;
+    bank.wetSproutProgress += dt * bank.current * humidity * 0.00018;
+    const shouldDiscard = bank.discardClock <= 0 && bank.current > 5;
+    const sprouted = bank.wetSproutProgress >= 1 && bank.current > 1;
+    if (!shouldDiscard && !sprouted) continue;
+    const amount = Math.min(bank.current, sprouted ? 1 : rand(0.7, 1.5));
+    bank.current -= amount;
+    bank.dispersed += amount;
+    if (sprouted) {
+      bank.sproutedInStore += amount;
+      bank.wetSproutProgress = Math.max(0, bank.wetSproutProgress - 1);
+    }
+    bank.discardClock = rand(20, 38);
+    vegetationEcology.stats.antDispersedSeeds += amount;
+    const angle = rand(0, Math.PI * 2);
+    const radius = rand(3.1, 5.7);
+    addSoilSeedCohort(
+      colony.nest.x + Math.cos(angle) * radius,
+      colony.nest.y + Math.sin(angle) * radius * 0.8,
+      Object.keys(bank.species).sort((a, b) => (bank.species[b] || 0) - (bank.species[a] || 0))[0] || 'needlegrass',
+      Math.max(1, Math.round(amount)),
+      { viability: sprouted ? 0.98 : rand(0.55, 0.84), dispersedByColonyId: colony.id, progress: sprouted ? 0.82 : rand(0.08, 0.46) },
+    );
+  }
+}
+
+function updateVegetationEcology(dt) {
+  const seasonKey = Math.floor(simTime / 92);
+  const activePlantCrops = () => foods.filter((food) => food.amount > 0 && food.ecologySource === 'plant seedfall').length;
+  for (const plant of vegetationEcology.plants) {
+    if (!plant.alive) continue;
+    if (environment.season.name === 'spring') {
+      plant.maturity = clamp(plant.maturity + dt * 0.0017 * (0.7 + weather.postRainHumidity * 0.5), 0, 1);
+      plant.health = clamp(plant.health + dt * 0.0014, 0, 1);
+      plant.phenology = plant.maturity < 0.45 ? 'seedling growth' : environment.seasonProgress > 0.48 ? 'flowering and setting seed' : 'spring growth';
+    } else if (environment.season.name === 'summer') {
+      plant.health = clamp(plant.health - dt * 0.00028, 0.34, 1);
+      plant.phenology = plantSeedWindow(plant) ? 'ripening seed head' : 'summer growth';
+    } else if (environment.season.name === 'autumn') plant.phenology = 'dry seed fall';
+    else {
+      plant.phenology = 'winter dormancy';
+      if (environment.seasonProgress > 0.62 && plant.lastWinterCheck !== seasonKey) {
+        plant.lastWinterCheck = seasonKey;
+        const mortalityRisk = plant.maturity < 0.28 ? 0.14 : plant.health < 0.48 ? 0.11 : 0.025;
+        if (random() < mortalityRisk) {
+          plant.alive = false;
+          plant.visual.group.visible = false;
+          vegetationEcology.stats.plantDeaths++;
+          addSoilSeedCohort(plant.x, plant.z, plant.species, Math.max(1, Math.round(plant.seedsProduced * 0.05)), { sourcePlantId: plant.id, viability: rand(0.35, 0.72) });
+          continue;
+        }
+      }
+    }
+
+    if (plant.maturity > 0.54 && plantSeedWindow(plant) && plant.producedSeasonKey !== seasonKey && activePlantCrops() < 10) {
+      const profile = PLANT_PROFILES[plant.species];
+      const crop = Math.max(6, Math.round(profile.maxCrop * plant.maturity * plant.health * rand(0.72, 1.12)));
+      const angle = rand(0, Math.PI * 2);
+      const food = addFood(
+        plant.x + Math.cos(angle) * rand(0.28, 0.55),
+        plant.z + Math.sin(angle) * rand(0.24, 0.48),
+        'seed', crop, rand(0.62, 0.92),
+        { source: 'plant seedfall', sourcePlantId: plant.id, seedSpecies: plant.species },
+      );
+      plant.cropFoodId = foods.indexOf(food);
+      plant.producedSeasonKey = seasonKey;
+      plant.seedsProduced += crop;
+      vegetationEcology.stats.seedsProduced += crop;
+    }
+    updateSeedPlantVisual(plant);
+  }
+
+  for (const food of foods) {
+    if (food.amount <= 0 || food.ecologySource !== 'plant seedfall' || simTime - food.createdAt < 66) continue;
+    const returned = Math.max(1, Math.round(food.amount * 0.34));
+    addSoilSeedCohort(food.x, food.z, food.seedSpecies, returned, { sourcePlantId: food.sourcePlantId, viability: rand(0.58, 0.92) });
+    food.amount = 0;
+    food.mesh.visible = false;
+  }
+
+  if (environment.season.name === 'spring') {
+    for (let i = vegetationEcology.soilSeeds.length - 1; i >= 0; i--) {
+      const cohort = vegetationEcology.soilSeeds[i];
+      const moisture = 0.34 + weather.postRainHumidity * 0.7 + weather.rain * 0.8;
+      cohort.viability = Math.max(0, cohort.viability - dt * 0.00022);
+      cohort.germinationProgress += dt * 0.009 * moisture * cohort.viability;
+      if (cohort.germinationProgress < 1 || !plantSpotClear(cohort.x, cohort.z, 1.05)) continue;
+      const plant = createSeedPlant(cohort.x, cohort.z, cohort.species, rand(0.06, 0.13), cohort.dispersedByColonyId);
+      if (!plant) continue;
+      vegetationEcology.stats.germinations++;
+      if (cohort.dispersedByColonyId) vegetationEcology.stats.antDispersedGerminations++;
+      cohort.count--;
+      cohort.germinationProgress = rand(0, 0.18);
+      if (cohort.count <= 0) vegetationEcology.soilSeeds.splice(i, 1);
+    }
+  } else {
+    for (const cohort of vegetationEcology.soilSeeds) cohort.viability = Math.max(0, cohort.viability - dt * 0.00008);
+  }
+  for (let i = vegetationEcology.soilSeeds.length - 1; i >= 0; i--) {
+    if (vegetationEcology.soilSeeds[i].viability <= 0.05) vegetationEcology.soilSeeds.splice(i, 1);
+  }
+  updateColonySeedBanks(dt);
+}
+
+const initialPlantSpecies = ['needlegrass', 'needlegrass', 'desertForb', 'saltbush'];
+for (let i = 0; i < 19; i++) {
+  let x;
+  let z;
+  let attempts = 0;
+  do {
+    x = rand(-HALF_W + 1.2, HALF_W - 1.2);
+    z = rand(-HALF_D + 1.2, HALF_D - 1.2);
+    attempts++;
+  } while (!plantSpotClear(x, z, 1.35) && attempts < 40);
+  createSeedPlant(x, z, initialPlantSpecies[i % initialPlantSpecies.length], rand(0.58, 1));
+}
+for (let i = 0; i < 14; i++) {
+  addSoilSeedCohort(rand(-HALF_W + 1.5, HALF_W - 1.5), rand(-HALF_D + 1.5, HALF_D - 1.5), initialPlantSpecies[i % initialPlantSpecies.length], Math.floor(rand(1, 4)), { progress: rand(0.18, 0.78) });
+}
 
 const predatorMesh = makeProp('beetle', HALF_W - 1.2, HALF_D - 1.2, 2.05, 0);
 predatorMesh.material = propMaterials.beetle.clone();
@@ -894,6 +1472,42 @@ vestibuleSignal.position.copy(vestibuleCenter);
 vestibuleSignal.rotation.x = Math.PI / 2;
 vestibuleSignal.renderOrder = 8;
 homeNestScanGroup.add(vestibuleSignal);
+
+function makeGranaryVisual(parent, center, capacity, color) {
+  const mesh = new THREE.InstancedMesh(
+    new THREE.IcosahedronGeometry(0.075, 0),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, fog: false }),
+    capacity,
+  );
+  const granaryMatrix = new THREE.Matrix4();
+  const granaryScale = new THREE.Vector3();
+  const granaryQuaternion = new THREE.Quaternion();
+  for (let i = 0; i < capacity; i++) {
+    const angle = i * 2.399;
+    const ring = 0.16 + Math.sqrt(i / capacity) * 0.86;
+    const layer = Math.floor(i / 24);
+    granaryScale.set(rand(0.58, 1.18), rand(0.42, 0.72), rand(0.58, 1.12));
+    granaryQuaternion.setFromEuler(new THREE.Euler(i * 0.31, i * 0.73, i * 0.17));
+    granaryMatrix.compose(
+      new THREE.Vector3(
+        center.x + Math.cos(angle) * ring,
+        center.y - 0.28 + layer * 0.085 + Math.sin(i * 1.7) * 0.025,
+        center.z + Math.sin(angle) * ring * 0.55,
+      ),
+      granaryQuaternion,
+      granaryScale,
+    );
+    mesh.setMatrixAt(i, granaryMatrix);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  mesh.count = 0;
+  mesh.renderOrder = 6;
+  parent.add(mesh);
+  return mesh;
+}
+
+const homeGranaryCenter = tunnelSegments[2].curve.getPointAt(1).clone();
+const homeGranaryVisual = makeGranaryVisual(homeNestScanGroup, homeGranaryCenter, 76, 0xd9b965);
 
 const entranceCachePool = Array.from({ length: 48 }, () => {
   const item = new THREE.Mesh(
@@ -1301,7 +1915,7 @@ addRivalNestTunnel([
 const rivalNurseryCurve = addRivalNestTunnel([
   V(8.4, -3.6, -4.9), V(9.4, -4.0, -5.8), V(10.4, -4.5, -6.6), V(11.25, -4.85, -7.15),
 ], 0.29, [1.62, 0.52, 1.12]);
-addRivalNestTunnel([
+const rivalStoresCurve = addRivalNestTunnel([
   V(8.4, -3.6, -4.9), V(7.5, -3.9, -4.5), V(6.6, -4.15, -4.0), V(5.7, -4.4, -3.75),
 ], 0.27, [1.48, 0.48, 1.04]);
 addRivalNestTunnel([
@@ -1309,6 +1923,7 @@ addRivalNestTunnel([
 ], 0.31, [1.5, 0.55, 1.1]);
 
 const rivalNurseryCenter = rivalNurseryCurve.getPointAt(1).clone();
+const rivalGranaryVisual = makeGranaryVisual(rivalNestScanGroup, rivalStoresCurve.getPointAt(1), 58, 0xb9c77a);
 const rivalQueenSprite = new THREE.Sprite(new THREE.SpriteMaterial({
   map: antMaterials[2].map, color: 0x7f9eb2, transparent: true, alphaTest: 0.04, depthWrite: false, depthTest: false, fog: false,
 }));
@@ -1539,6 +2154,8 @@ function updateEntranceVisuals() {
 function updateUnderground() {
   homeNestScanGroup.visible = cameraRig.focusedColonyId === HOME_COLONY_ID;
   rivalNestScanGroup.visible = cameraRig.focusedColonyId === RIVAL_COLONY_ID;
+  homeGranaryVisual.count = Math.min(homeGranaryVisual.instanceMatrix.count, Math.floor(homeSeedBank.current));
+  rivalGranaryVisual.count = Math.min(rivalGranaryVisual.instanceMatrix.count, Math.floor(rivalSeedBank.current));
   const tipPosition = new THREE.Vector3();
   const active = [];
   for (let segmentIndex = 0; segmentIndex < tunnelSegments.length; segmentIndex++) {
@@ -2160,6 +2777,7 @@ function createNanitic(queen, broodItem) {
     tasksCompleted: 0,
     infection: 0,
   };
+  ensureWorkerNavigation(worker, false);
   queen.nanitics.push(worker);
   queen.workersEclosed++;
   recordLineageEvent(queen.workersEclosed === 1 ? 'first-nanitic-eclosed' : 'worker-eclosed', queen, {
@@ -2178,6 +2796,12 @@ function registerFoundingColony(queen) {
     contactEvents: 0, activeTransfers: 0, storageTransfers: 0,
   };
   const pheromoneField = createColonyPheromoneField(colonyId, 0.12);
+  const foragingNetwork = createForagingNetwork(
+    colonyId,
+    new THREE.Vector2(queen.x, queen.z),
+    queen.natalColonyId === RIVAL_COLONY_ID ? 0x7ba9bc : 0xd98763,
+  );
+  const seedBank = createColonySeedBank(colonyId, 0);
   const record = registerColony({
     id: colonyId,
     lineageId: queen.lineageId,
@@ -2200,6 +2824,8 @@ function registerFoundingColony(queen) {
     reproduction: queen.reproduction,
     entrance,
     pheromoneField,
+    foragingNetwork,
+    seedBank,
     queen,
     get storedFood() { return queen.colonyFood; },
     get foodDelivered() { return queen.foodDelivered; },
@@ -2240,13 +2866,31 @@ function updateFoundingBrood(queen, dt) {
 }
 
 function chooseYoungColonyFood(worker) {
+  const network = colonyForagingNetworks.get(worker.colonyId);
+  const navigation = ensureWorkerNavigation(worker);
+  const sector = network ? chooseForagingSector(worker, network) : null;
   let best = null;
   let bestScore = -Infinity;
   for (const food of foods) {
     if (food.amount <= 0) continue;
+    if (network && sector) {
+      const foodSector = sectorForPoint(network, food.x, food.z);
+      const sectorDelta = Math.min(Math.abs(foodSector - sector.id), FORAGING_SECTOR_COUNT - Math.abs(foodSector - sector.id));
+      if (sectorDelta > (navigation.confidence > 0.35 ? 0 : 1)) continue;
+    }
     const distance = Math.hypot(food.x - worker.x, food.z - worker.z);
-    const score = food.nutrition * 3.2 * worker.genome.foraging + Math.log1p(food.amount) - distance * 0.2;
+    const memoryDistance = navigation.rememberedX == null ? 0
+      : Math.hypot(food.x - navigation.rememberedX, food.z - navigation.rememberedZ);
+    const privateWeight = navigation.confidence * (0.55 + flightLightLevel() * 0.85);
+    const socialWeight = (sector?.socialPulse || 0) * 0.58;
+    const score = food.nutrition * 3.2 * worker.genome.foraging + Math.log1p(food.amount) - distance * 0.2
+      - memoryDistance * privateWeight * 0.22 + socialWeight * 0.5;
     if (score > bestScore) { bestScore = score; best = food; }
+  }
+  if (network && sector) {
+    const privateWeight = navigation.confidence * (0.55 + flightLightLevel() * 0.85);
+    const socialWeight = sector.socialPulse * 0.58 + sector.trunkStrength * 0.32;
+    navigation.guidance = privateWeight > socialWeight ? 'private route memory' : socialWeight > 0.12 ? 'social sector activation' : 'sector exploration';
   }
   return best;
 }
@@ -2283,14 +2927,42 @@ function updateYoungWorker(queen, worker, dt) {
   const nestDx = queen.x - worker.x;
   const nestDz = queen.z - worker.z;
   const nestDistance = Math.hypot(nestDx, nestDz);
+  const navigation = ensureWorkerNavigation(worker);
+  if (!worker.carrying && navigation.learningWalk < 1) {
+    const outward = Math.atan2(worker.z - queen.z, worker.x - queen.x);
+    worker.desired = outward + Math.PI * 0.5 + Math.sin(worker.phase * 0.16) * 0.3;
+    if (nestDistance > 1.45) worker.desired = Math.atan2(nestDz, nestDx) + Math.PI * 0.42;
+    worker.heading += clamp(wrapAngle(worker.desired - worker.heading), -dt * 3.2, dt * 3.2);
+    const velocity = worker.speed * 0.62;
+    worker.x += Math.cos(worker.heading) * velocity * dt;
+    worker.z += Math.sin(worker.heading) * velocity * dt;
+    worker.distanceTraveled += velocity * dt;
+    navigation.learningWalk = clamp(navigation.learningWalk + dt * 0.14, 0, 1);
+    navigation.guidance = 'learning walk';
+    worker.state = 'learning nest panorama before first forage';
+    if (navigation.learningWalk >= 1) {
+      const network = colonyForagingNetworks.get(worker.colonyId);
+      if (network) {
+        network.learningWalksCompleted++;
+        chooseForagingSector(worker, network, true);
+      }
+    }
+    return;
+  }
   if (worker.carrying || worker.energy < 18 || weather.rain > 0.7) {
     worker.desired = Math.atan2(nestDz, nestDx);
     worker.state = worker.carrying ? 'carrying food to the incipient colony' : 'returning to the founding chamber';
     if (worker.carrying) colonyPherDeposit(worker.colonyId, worker.x, worker.z, 0.018);
     if (nestDistance < 0.5) {
       if (worker.carrying) {
+        recordForagingDelivery(worker);
         queen.colonyFood += 2.15 * worker.carryingNutrition;
         queen.foodDelivered++;
+        storeSeedCargo(worker.colonyId, {
+          kind: worker.carryingKind,
+          seedSpecies: worker.carryingSeedSpecies,
+          sourcePlantId: worker.carryingSourcePlantId,
+        });
         if (!queen.firstDeliveryRecorded) {
           queen.firstDeliveryRecorded = true;
           recordLineageEvent('first-food-delivery', queen, { workerId: worker.id, kind: worker.carryingKind });
@@ -2298,6 +2970,8 @@ function updateYoungWorker(queen, worker, dt) {
         worker.carrying = false;
         worker.carryingKind = null;
         worker.carryingNutrition = 1;
+        worker.carryingSeedSpecies = null;
+        worker.carryingSourcePlantId = null;
         worker.trips++;
         worker.tasksCompleted++;
       }
@@ -2308,6 +2982,7 @@ function updateYoungWorker(queen, worker, dt) {
     }
   } else {
     if (!worker.targetFood || worker.targetFood.amount <= 0 || worker.turnClock <= 0) {
+      if (worker.targetFood && worker.targetFood.amount <= 0 && !worker.carrying) recordForagingFailure(worker);
       worker.targetFood = youngColonyStressTest ? null : chooseYoungColonyFood(worker);
       worker.turnClock = rand(1.2, 2.6);
     }
@@ -2316,17 +2991,31 @@ function updateYoungWorker(queen, worker, dt) {
       const dz = worker.targetFood.z - worker.z;
       const distance = Math.hypot(dx, dz);
       worker.desired = Math.atan2(dz, dx) + Math.sin(worker.phase * 0.13) * 0.09;
-      worker.state = 'foraging independently for the young colony';
+      worker.state = `foraging by ${navigation.guidance}`;
+      const network = colonyForagingNetworks.get(worker.colonyId);
+      if (network && navigation.guidance === 'private route memory') network.memoryGuidedSteps += dt;
+      else if (network && navigation.guidance === 'social sector activation') network.socialGuidedSteps += dt;
       if (distance < 0.42 && worker.targetFood.amount > 0) {
         worker.carrying = true;
         worker.carryingKind = worker.targetFood.kind;
         worker.carryingNutrition = worker.targetFood.nutrition;
-        worker.targetFood.amount -= 1;
-        worker.targetFood.mesh.scale.setScalar(Math.max(0.24, Math.sqrt(worker.targetFood.amount / worker.targetFood.initial)));
-        if (worker.targetFood.amount <= 0) worker.targetFood.mesh.visible = false;
+        worker.carryingSeedSpecies = worker.targetFood.seedSpecies;
+        worker.carryingSourcePlantId = worker.targetFood.sourcePlantId;
+        recordFoodDiscovery(worker, worker.targetFood);
+        removeFoodUnits(worker.targetFood, 1, 'ant harvest');
       }
     } else {
-      if (worker.turnClock <= 0) worker.desired += rand(-0.9, 0.9);
+      navigation.searchTime += dt;
+      if (navigation.searchTime > 16) {
+        recordForagingFailure(worker);
+        navigation.searchTime = 0;
+      }
+      const network = colonyForagingNetworks.get(worker.colonyId);
+      const sector = network && navigation.sectorId != null ? network.sectors[navigation.sectorId] : null;
+      if (network && sector) {
+        const target = sectorTarget(network, sector);
+        worker.desired = Math.atan2(target.z - worker.z, target.x - worker.x) + Math.sin(worker.phase * 0.11) * 0.16;
+      } else if (worker.turnClock <= 0) worker.desired += rand(-0.9, 0.9);
       if (nestDistance > 7.5) worker.desired = Math.atan2(nestDz, nestDx);
       worker.state = 'searching the local sector for food';
     }
@@ -2783,6 +3472,7 @@ function spawnAnt(initialPopulation = false, options = {}) {
     taskExperience: { nurse: 0, transfer: 0, excavator: 0, sanitizer: 0, forager: initialPopulation ? rand(0, 5) : 0 },
     state: 'exploring',
   };
+  ensureWorkerNavigation(ant, initialPopulation);
   ant.assignedRole = ant.tendency;
   ants.push(ant);
   if (options.newborn) {
@@ -2901,13 +3591,8 @@ function updatePredator(dt) {
       predator.z += Math.sin(predator.heading) * dt * 1.25;
       if (Math.hypot(dx, dz) < 0.72) {
         const stolen = Math.min(source.amount, dt * 1.15);
-        source.amount -= stolen;
+        removeFoodUnits(source, stolen, 'wildlife');
         predator.foodStolen += stolen;
-        source.mesh.scale.setScalar(Math.max(0.24, Math.sqrt(source.amount / source.initial)));
-        if (source.amount <= 0) {
-          source.mesh.visible = false;
-          createSignal(source.x, source.z, 0x88483d);
-        }
       }
     }
     alignToGround(predatorMesh, predator.x, predator.z, -predator.heading - Math.PI / 2, 0.12);
@@ -2951,7 +3636,7 @@ function updatePredator(dt) {
       predator.z += Math.sin(predator.heading) * dt * 1.1;
       if (Math.hypot(dx, dz) < 0.7) {
         const stolen = Math.min(source.amount, dt * 0.7);
-        source.amount -= stolen;
+        removeFoodUnits(source, stolen, 'wildlife');
         predator.foodStolen += stolen;
       }
     }
@@ -3191,6 +3876,7 @@ function spawnRival(newborn = false, options = {}) {
     distanceTraveled: 0,
     state: newborn ? 'newly eclosed' : 'patrolling rival territory',
   };
+  ensureWorkerNavigation(rival, !newborn);
   rivalAnts.push(rival);
   return rival;
 }
@@ -3240,6 +3926,8 @@ const homeColonyRecord = registerColony({
   reproduction: homeReproduction,
   entrance: entranceBiology,
   pheromoneField: homePheromoneField,
+  foragingNetwork: homeForagingNetwork,
+  seedBank: homeSeedBank,
   queen: { id: 'queen-amber-001', alive: true, genome: homeQueenGenome },
   get storedFood() { return storedFood; },
   get foodDelivered() { return delivered; },
@@ -3268,6 +3956,8 @@ const rivalColonyRecord = registerColony({
   reproduction: rivalReproduction,
   entrance: rivalEntranceBiology,
   pheromoneField: rivalPheromoneField,
+  foragingNetwork: rivalForagingNetwork,
+  seedBank: rivalSeedBank,
   queen: { id: 'queen-slate-001', alive: true, genome: rivalQueenGenome },
   get storedFood() { return rivalColony.storedFood; },
   get foodDelivered() { return rivalColony.delivered; },
@@ -3336,6 +4026,7 @@ function updateRivalAnt(rival, dt) {
     rival.state = 'moving cached food through slate nest';
     if (rival.transferTimer <= 0 && rival.transferCargo) {
       rivalColony.storedFood = Math.min(150, rivalColony.storedFood + rival.transferCargo.value);
+      storeSeedCargo(RIVAL_COLONY_ID, rival.transferCargo);
       rivalColony.delivered++;
       rivalEntranceBiology.storageTransfers++;
       rival.tasksCompleted++;
@@ -3413,6 +4104,20 @@ function updateRivalAnt(rival, dt) {
   const homeDx = RIVAL_NEST.x - rival.x;
   const homeDz = RIVAL_NEST.y - rival.z;
   const homeDistance = Math.hypot(homeDx, homeDz);
+  const navigation = ensureWorkerNavigation(rival, rival.generation === 0);
+  if (!rival.carrying && navigation.learningWalk < 1 && homeDistance < 2.2 && rival.role !== 'guard') {
+    const outward = Math.atan2(rival.z - RIVAL_NEST.y, rival.x - RIVAL_NEST.x);
+    rival.desired = outward + Math.PI * 0.5 + Math.sin(rival.phase * 0.14) * 0.28;
+    navigation.learningWalk = clamp(navigation.learningWalk + dt * 0.12, 0, 1);
+    navigation.guidance = 'learning walk';
+    rival.state = 'slate learning walk around the entrance';
+    if (navigation.learningWalk >= 1) {
+      rivalForagingNetwork.learningWalksCompleted++;
+      chooseForagingSector(rival, rivalForagingNetwork, true);
+    }
+    moveRival(rival, dt, 0.58);
+    return;
+  }
   if (rival.carrying) {
     rival.state = 'returning food to rival stores';
     rival.desired = Math.atan2(homeDz, homeDx) + Math.sin(rival.phase * 0.18) * 0.05;
@@ -3421,10 +4126,13 @@ function updateRivalAnt(rival, dt) {
       if (rivalEntranceBiology.cache.length < rivalEntranceBiology.capacity) {
         const nearby = rivalAnts.filter((worker) => worker !== rival && !worker.insideNest && !worker.carrying
           && Math.hypot(worker.x - RIVAL_NEST.x, worker.z - RIVAL_NEST.y) < 1.35).length;
+        recordForagingDelivery(rival);
         rivalEntranceBiology.cache.push({
           kind: rival.carryingKind || 'seed',
           nutrition: rival.carryingNutrition,
           value: 2.4 * rival.carryingNutrition,
+          seedSpecies: rival.carryingSeedSpecies || null,
+          sourcePlantId: rival.carryingSourcePlantId || null,
         });
         rivalEntranceBiology.foodReturned++;
         rivalEntranceBiology.cacheDeposits++;
@@ -3434,6 +4142,8 @@ function updateRivalAnt(rival, dt) {
         rival.carrying = false;
         rival.carryingKind = null;
         rival.carryingNutrition = 1;
+        rival.carryingSeedSpecies = null;
+        rival.carryingSourcePlantId = null;
         rival.tasksCompleted++;
         rival.trips++;
         rival.targetFood = null;
@@ -3460,21 +4170,28 @@ function updateRivalAnt(rival, dt) {
     rival.carrying = true;
     rival.carryingNutrition = pickup.nutrition;
     rival.carryingKind = pickup.kind;
+    rival.carryingSeedSpecies = pickup.seedSpecies;
+    rival.carryingSourcePlantId = pickup.sourcePlantId;
     rival.targetFood = pickup;
-    pickup.amount -= 1;
-    pickup.mesh.scale.setScalar(Math.max(0.24, Math.sqrt(pickup.amount / pickup.initial)));
+    recordFoodDiscovery(rival, pickup);
+    removeFoodUnits(pickup, 1, 'ant harvest');
     rival.state = 'rival collecting contested food';
-    if (pickup.amount <= 0) pickup.mesh.visible = false;
     return;
   }
 
   if (!rival.targetFood || rival.targetFood.amount <= 0 || rival.turnClock <= 0) {
+    if (rival.targetFood && rival.targetFood.amount <= 0) recordForagingFailure(rival);
+    const sector = chooseForagingSector(rival, rivalForagingNetwork);
     let bestSource = null;
     let bestScore = -Infinity;
     for (const food of foods) {
       if (food.amount <= 0) continue;
       const distance = Math.hypot(food.x - rival.x, food.z - rival.z);
-      const score = food.nutrition * 2.2 * rival.genome.foraging + Math.log1p(food.amount) - distance * 0.24;
+      const foodSector = sectorForPoint(rivalForagingNetwork, food.x, food.z);
+      const sectorDelta = Math.min(Math.abs(foodSector - sector.id), FORAGING_SECTOR_COUNT - Math.abs(foodSector - sector.id));
+      const memoryDistance = navigation.rememberedX == null ? 0 : Math.hypot(food.x - navigation.rememberedX, food.z - navigation.rememberedZ);
+      const score = food.nutrition * 2.2 * rival.genome.foraging + Math.log1p(food.amount) - distance * 0.24
+        - sectorDelta * 0.7 - memoryDistance * navigation.confidence * 0.12 + sector.socialPulse * 0.35;
       if (score > bestScore) { bestScore = score; bestSource = food; }
     }
     rival.targetFood = bestSource;
@@ -3485,7 +4202,13 @@ function updateRivalAnt(rival, dt) {
     const foodAngle = Math.atan2(rival.targetFood.z - rival.z, rival.targetFood.x - rival.x);
     const scent = rivalPherSample(rival.x + Math.cos(rival.heading) * 0.8, rival.z + Math.sin(rival.heading) * 0.8);
     rival.desired = foodAngle + Math.sin(rival.phase * 0.11) * (scent > 0.03 ? 0.08 : 0.22);
-    rival.state = rival.role === 'scout' ? 'scouting contested food' : 'following rival trail';
+    const sector = rivalForagingNetwork.sectors[navigation.sectorId ?? 0];
+    const privateWeight = navigation.confidence * (0.55 + flightLightLevel() * 0.85);
+    const socialWeight = sector.socialPulse * 0.58 + scent * 0.45;
+    navigation.guidance = privateWeight > socialWeight ? 'private route memory' : socialWeight > 0.12 ? 'social sector activation' : 'sector exploration';
+    if (privateWeight > socialWeight) rivalForagingNetwork.memoryGuidedSteps += dt;
+    else rivalForagingNetwork.socialGuidedSteps += dt;
+    rival.state = rival.role === 'scout' ? 'scouting contested food' : `foraging by ${navigation.guidance}`;
   } else {
     rival.desired += rand(-0.5, 0.5);
     rival.state = 'patrolling rival territory';
@@ -3700,11 +4423,14 @@ function depositInEntranceCache(ant) {
     && worker.nestRouteKey === 'vestibule' && worker.nestMode === 'working'
     && worker.assignedRole === 'forager' && worker !== ant).length;
   const nutrition = ant.carryingNutrition || 1;
-  entranceBiology.cache.push({
-    kind: ant.carryingKind || 'seed',
-    nutrition,
-    value: 2.5 * nutrition,
-  });
+  recordForagingDelivery(ant);
+    entranceBiology.cache.push({
+      kind: ant.carryingKind || 'seed',
+      nutrition,
+      value: 2.5 * nutrition,
+      seedSpecies: ant.carryingSeedSpecies || null,
+      sourcePlantId: ant.carryingSourcePlantId || null,
+    });
   entranceBiology.foodReturned++;
   entranceBiology.cacheDeposits++;
   entranceBiology.recentReturns = Math.min(1, entranceBiology.recentReturns + 0.22);
@@ -3714,6 +4440,8 @@ function depositInEntranceCache(ant) {
   ant.carrying = false;
   ant.carryingKind = null;
   ant.carryingNutrition = 1;
+  ant.carryingSeedSpecies = null;
+  ant.carryingSourcePlantId = null;
   ant.tasksCompleted++;
   ant.taskExperience.forager += 1;
   ant.nestTimer = Math.max(ant.nestTimer, rand(1.4, 2.8));
@@ -4177,6 +4905,7 @@ function updateNestAnt(ant, dt) {
       if (ant.transferCargo) {
         delivered++;
         storedFood = Math.min(180, storedFood + ant.transferCargo.value);
+        storeSeedCargo(HOME_COLONY_ID, ant.transferCargo);
         entranceBiology.storageTransfers++;
         ant.transferCargo = null;
         ant.tasksCompleted++;
@@ -4274,6 +5003,20 @@ function updateAnt(ant, dt) {
   const nestDx = NEST.x - ant.x;
   const nestDz = NEST.y - ant.z;
   const nestDistance = Math.hypot(nestDx, nestDz);
+  const navigation = ensureWorkerNavigation(ant, ant.generation === 0);
+  let learningWalkActive = false;
+  if (!ant.carrying && navigation.learningWalk < 1 && nestDistance < 2.7) {
+    const outward = Math.atan2(ant.z - NEST.y, ant.x - NEST.x);
+    steerTowards(ant, outward + Math.PI * 0.5 + Math.sin(ant.phase * 0.15) * 0.3, 0.82);
+    navigation.learningWalk = clamp(navigation.learningWalk + dt * 0.11, 0, 1);
+    navigation.guidance = 'learning walk';
+    learningWalkActive = true;
+    ant.state = 'learning the nest panorama';
+    if (navigation.learningWalk >= 1) {
+      homeForagingNetwork.learningWalksCompleted++;
+      chooseForagingSector(ant, homeForagingNetwork, true);
+    }
+  }
 
   if (predator.active) {
     const predatorDistance = Math.hypot(ant.x - predator.x, ant.z - predator.z);
@@ -4334,19 +5077,17 @@ function updateAnt(ant, dt) {
       beginNestJourney(ant, 'vestibule');
       return;
     }
-  } else {
+  } else if (!learningWalkActive) {
     const food = nearestFood(ant);
     if (food) {
       ant.carrying = true;
       ant.carryingNutrition = food.nutrition;
       ant.carryingKind = food.kind;
+      ant.carryingSeedSpecies = food.seedSpecies;
+      ant.carryingSourcePlantId = food.sourcePlantId;
       ant.state = 'collecting';
-      food.amount -= 1;
-      food.mesh.scale.setScalar(Math.max(0.24, Math.sqrt(food.amount / food.initial)));
-      if (food.amount <= 0) {
-        food.mesh.visible = false;
-        createSignal(food.x, food.z, 0x6f7551);
-      }
+      recordFoodDiscovery(ant, food);
+      removeFoodUnits(food, 1, 'ant harvest');
     } else {
       const look = 0.8;
       const side = 0.56;
@@ -4354,21 +5095,46 @@ function updateAnt(ant, dt) {
       const pC = pherSample(ant.x + Math.cos(ant.heading) * look, ant.z + Math.sin(ant.heading) * look);
       const pR = pherSample(ant.x + Math.cos(ant.heading + side) * look, ant.z + Math.sin(ant.heading + side) * look);
       const strongest = Math.max(pL, pC, pR);
-      if (strongest > 0.035 / ant.genome.foraging && random() < clamp(0.72 + ant.genome.foraging * 0.15, 0.78, 0.93)) {
+      const sector = chooseForagingSector(ant, homeForagingNetwork);
+      const privateWeight = navigation.confidence * (0.55 + flightLightLevel() * 0.85);
+      const socialWeight = strongest * 0.42 + sector.socialPulse * 0.32 + entranceBiology.activation * 0.08;
+      if (navigation.rememberedX != null && privateWeight > socialWeight && navigation.searchTime < 18) {
+        const memoryAngle = Math.atan2(navigation.rememberedZ - ant.z, navigation.rememberedX - ant.x);
+        steerTowards(ant, memoryAngle + ant.laneBias * 0.22, 0.82);
+        ant.state = 'following private route memory';
+        navigation.guidance = 'private route memory';
+        navigation.searchTime += dt;
+        homeForagingNetwork.memoryGuidedSteps += dt;
+      } else if (strongest > 0.035 / ant.genome.foraging && random() < clamp(0.72 + ant.genome.foraging * 0.15, 0.78, 0.93)) {
         ant.state = 'following scent';
+        navigation.guidance = 'social trail information';
+        homeForagingNetwork.socialGuidedSteps += dt;
         let offset = 0;
         if (pL > pC && pL > pR) offset = -side;
         else if (pR > pC) offset = side;
         steerTowards(ant, ant.heading + offset + ant.laneBias * 0.5 + rand(-0.09, 0.09), 0.66);
+      } else if (sector.socialPulse > 0.12) {
+        const target = sectorTarget(homeForagingNetwork, sector);
+        steerTowards(ant, Math.atan2(target.z - ant.z, target.x - ant.x) + ant.laneBias * 0.3, 0.72);
+        ant.state = 'following social sector information';
+        navigation.guidance = 'social sector activation';
+        homeForagingNetwork.socialGuidedSteps += dt;
       } else {
+        navigation.searchTime += dt;
+        if (navigation.searchTime > 20) {
+          recordForagingFailure(ant);
+          navigation.searchTime = 0;
+        }
         ant.state = (weather.rain > 0.72 || ant.energy < 30) && nestDistance > 2 ? 'returning to nest' : 'exploring';
         if ((weather.rain > 0.72 || ant.energy < 30) && nestDistance > 2) {
           steerTowards(ant, Math.atan2(nestDz, nestDx), 0.42);
         } else if (ant.turnClock <= 0) {
-          const outward = Math.atan2(ant.z - NEST.y, ant.x - NEST.x);
-          const exploratory = ant.heading + rand(-0.75, 0.75);
-          const target = nestDistance < 2.0 ? outward + rand(-0.55, 0.55) : exploratory;
-          steerTowards(ant, target, 0.72);
+          const searchTarget = sectorTarget(homeForagingNetwork, sector);
+          const sectorAngle = Math.atan2(searchTarget.z - ant.z, searchTarget.x - ant.x);
+          const exploratory = sectorAngle + rand(-0.52, 0.52);
+          const targetAngle = nestDistance < 2.0 ? sectorAngle + rand(-0.28, 0.28) : exploratory;
+          steerTowards(ant, targetAngle, 0.72);
+          navigation.guidance = 'sector exploration';
           ant.turnClock = rand(0.3, 1.7);
         }
       }
@@ -4391,7 +5157,7 @@ function updateAnt(ant, dt) {
     steerTowards(ant, Math.atan2(-ant.z, -ant.x), 0.92);
   }
 
-  if (!ant.carrying && nestDistance < 1.55 && weather.rain < 0.52 && ant.energy >= 30) {
+  if (!ant.carrying && !learningWalkActive && nestDistance < 1.55 && weather.rain < 0.52 && ant.energy >= 30) {
     const outward = Math.atan2(ant.z - NEST.y, ant.x - NEST.x);
     steerTowards(ant, outward + ant.laneBias * 0.8, 0.76);
     ant.state = 'leaving nest';
@@ -4576,7 +5342,9 @@ function updateAntNote() {
     <dt>energy</dt><dd>${Math.round(selectedAnt.energy)}%</dd>
     <dt>health</dt><dd>${Math.round(selectedAnt.health)}%</dd>
     <dt>condition</dt><dd>${infection > 0 ? `infected ${Math.round(infection * 100)}%` : selectedAnt.health < 70 ? 'injured' : 'healthy'}</dd>
-    <dt>cargo</dt><dd>${selectedAnt.transferCargo ? 'cached food transfer' : selectedAnt.sanitationCargo ? 'colony remains' : selectedAnt.soilCargo ? 'excavated soil' : selectedAnt.carrying ? 'food fragment' : 'none'}</dd>
+    <dt>cargo</dt><dd>${selectedAnt.transferCargo ? selectedAnt.transferCargo.kind === 'seed' ? `${selectedAnt.transferCargo.seedSpecies || 'wild'} seed transfer` : 'cached food transfer' : selectedAnt.sanitationCargo ? 'colony remains' : selectedAnt.soilCargo ? 'excavated soil' : selectedAnt.carrying ? selectedAnt.carryingKind === 'seed' ? `${selectedAnt.carryingSeedSpecies || 'wild'} seed` : 'food fragment' : 'none'}</dd>
+    ${selectedAnt.navigation ? `<dt>navigation</dt><dd>sector ${selectedAnt.navigation.sectorId ?? '—'} · ${selectedAnt.navigation.guidance}</dd>
+    <dt>route memory</dt><dd>${Math.round(selectedAnt.navigation.confidence * 100)}% confidence · ${selectedAnt.navigation.successfulTrips} successful returns</dd>` : ''}
     ${selectedAnt.excavationProject != null ? `<dt>worksite</dt><dd>${tunnelSegments[selectedAnt.excavationProject].name}</dd>` : ''}
     <dt>completed</dt><dd>${selectedAnt.tasksCompleted || 0}</dd>
     <dt>nest trips</dt><dd>${selectedAnt.trips || 0}</dd>`;
@@ -4733,7 +5501,6 @@ function addObstacle(x, z) {
 }
 
 // ---------- simulation loop ----------
-let simTime = 0;
 let spawnClock = 0;
 let foodClock = 0;
 let paused = false;
@@ -4772,14 +5539,21 @@ function update(dt) {
     const roll = random();
     const kind = environment.season.name === 'winter' ? (roll < 0.72 ? 'seed' : 'crumb')
       : roll < 0.22 ? 'berry' : roll < 0.38 ? 'beetle' : roll < 0.62 ? 'seed' : 'crumb';
-    addFood(rand(-12, 13), rand(-9, 9), kind, Math.floor(rand(34, 72) * environment.season.food), rand(1.2, 1.7));
+    const seedSpecies = kind === 'seed' ? Object.keys(PLANT_PROFILES)[Math.floor(random() * Object.keys(PLANT_PROFILES).length)] : null;
+    addFood(
+      rand(-12, 13), rand(-9, 9), kind,
+      Math.floor(rand(34, 72) * environment.season.food), rand(1.2, 1.7),
+      kind === 'seed' ? { source: 'regional seed rain', seedSpecies } : { source: 'incidental seasonal food' },
+    );
   }
   updateSurvival(dt);
   updatePredator(dt);
   updateSpider(dt);
   updateWeather(dt);
+  updateVegetationEcology(dt);
   updateNuptialFlight(dt);
   updatePheromones(dt);
+  updateForagingNetworks(dt);
   updateEntranceBiology(dt);
   refreshConstructionProjects();
   updateLaborAssignments(dt);
@@ -5133,6 +5907,8 @@ function registeredColonySummary(colony) {
       activeTransfers: colony.entrance.activeTransfers,
       storageTransfers: colony.entrance.storageTransfers,
     } : null,
+    foragingNetwork: foragingNetworkSummary(colony.foragingNetwork),
+    seedBank: seedBankSummary(colony.seedBank),
     workersEclosed: colony.workersEclosed,
     deaths: colony.deaths,
     genetics: {
@@ -5142,6 +5918,50 @@ function registeredColonySummary(colony) {
         return counts;
       }, {}),
     },
+  };
+}
+
+function foragingNetworkSummary(network) {
+  if (!network) return null;
+  const activeSectors = network.sectors.filter((sector) => sector.activeForagers > 0).length;
+  const establishedTrunks = network.sectors.filter((sector) => sector.successes >= 2 && sector.trunkStrength > 0.08).length;
+  return {
+    sectorCount: network.sectors.length,
+    activeSectors,
+    establishedTrunks,
+    routeSwitches: network.routeSwitches,
+    learningWalksCompleted: network.learningWalksCompleted,
+    privateMemorySeconds: Number(network.memoryGuidedSteps.toFixed(1)),
+    socialInformationSeconds: Number(network.socialGuidedSteps.toFixed(1)),
+    sectors: network.sectors.map((sector) => {
+      const target = sectorTarget(network, sector);
+      return {
+        id: sector.id,
+        bearingDegrees: Math.round((sector.angle * 180 / Math.PI + 360) % 360),
+        confidence: Number(sector.confidence.toFixed(2)),
+        socialPulse: Number(sector.socialPulse.toFixed(2)),
+        discoveries: sector.discoveries,
+        successfulReturns: sector.successes,
+        failures: sector.failures,
+        activeForagers: sector.activeForagers,
+        trunkStrength: Number(sector.trunkStrength.toFixed(2)),
+        target: { x: Number(target.x.toFixed(1)), z: Number(target.z.toFixed(1)) },
+      };
+    }),
+  };
+}
+
+function seedBankSummary(bank) {
+  if (!bank) return null;
+  return {
+    currentSeeds: Number(bank.current.toFixed(1)),
+    capacity: bank.capacity,
+    lifetimeStored: Number(bank.totalStored.toFixed(1)),
+    consumed: Number(bank.consumed.toFixed(1)),
+    dispersedToSurface: Number(bank.dispersed.toFixed(1)),
+    sproutedInStore: Number(bank.sproutedInStore.toFixed(1)),
+    overflowDiscarded: bank.overflowDiscarded,
+    species: Object.fromEntries(Object.entries(bank.species).map(([species, count]) => [species, Number(count.toFixed(1))])),
   };
 }
 
@@ -5262,11 +6082,40 @@ window.render_game_to_text = () => {
       x: Number(food.x.toFixed(1)),
       z: Number(food.z.toFixed(1)),
       amount: Number(food.amount.toFixed(1)),
+      ecologySource: food.ecologySource,
+      sourcePlantId: food.sourcePlantId,
+      seedSpecies: food.seedSpecies,
     })),
     environment: {
       season: environment.season.name,
       seasonProgress: Number(environment.seasonProgress.toFixed(2)),
       pressure: environment.pressure,
+      vegetation: {
+        livingPlants: vegetationEcology.plants.filter((plant) => plant.alive).length,
+        seedlings: vegetationEcology.plants.filter((plant) => plant.alive && plant.maturity < 0.3).length,
+        seedBearingPlants: vegetationEcology.plants.filter((plant) => plant.alive && (plantSeedWindow(plant) || foods.some((food) => food.amount > 0 && food.sourcePlantId === plant.id))).length,
+        soilSeedCohorts: vegetationEcology.soilSeeds.length,
+        dormantSeedUnits: vegetationEcology.soilSeeds.reduce((sum, cohort) => sum + cohort.count, 0),
+        plantSeedPatches: foods.filter((food) => food.amount > 0 && food.ecologySource === 'plant seedfall').length,
+        antDispersedPlants: vegetationEcology.plants.filter((plant) => plant.alive && plant.dispersedByColonyId).length,
+        bySpecies: Object.keys(PLANT_PROFILES).reduce((counts, species) => {
+          counts[species] = vegetationEcology.plants.filter((plant) => plant.alive && plant.species === species).length;
+          return counts;
+        }, {}),
+        flows: Object.fromEntries(Object.entries(vegetationEcology.stats).map(([key, value]) => [key, Number(value.toFixed(1))])),
+        plants: vegetationEcology.plants.filter((plant) => plant.alive).slice(0, 24).map((plant) => ({
+          id: plant.id,
+          species: plant.species,
+          x: Number(plant.x.toFixed(1)),
+          z: Number(plant.z.toFixed(1)),
+          maturity: Number(plant.maturity.toFixed(2)),
+          health: Number(plant.health.toFixed(2)),
+          phenology: plant.phenology,
+          seedsProduced: plant.seedsProduced,
+          seedsHarvested: Number(plant.seedsHarvested.toFixed(1)),
+          dispersedByColonyId: plant.dispersedByColonyId,
+        })),
+      },
       nuptialFlightSuitability: Number(regionalMating.lastSuitability.toFixed(2)),
       activePredator: predator.active || spider.active,
       predators: {
@@ -5481,8 +6330,28 @@ window.render_game_to_text = () => {
       energy: Math.round(selectedAnt.energy),
       health: Math.round(selectedAnt.health),
       infection: Number((selectedAnt.infection || 0).toFixed(2)),
-      cargo: selectedAnt.transferCargo ? 'cached food transfer' : selectedAnt.sanitationCargo ? 'colony remains' : selectedAnt.soilCargo ? 'soil' : selectedAnt.carrying ? 'food' : 'none',
+      cargo: selectedAnt.transferCargo ? {
+        kind: selectedAnt.transferCargo.kind,
+        seedSpecies: selectedAnt.transferCargo.seedSpecies || null,
+        sourcePlantId: selectedAnt.transferCargo.sourcePlantId || null,
+      } : selectedAnt.sanitationCargo ? 'colony remains' : selectedAnt.soilCargo ? 'soil' : selectedAnt.carrying ? {
+        kind: selectedAnt.carryingKind,
+        seedSpecies: selectedAnt.carryingSeedSpecies || null,
+        sourcePlantId: selectedAnt.carryingSourcePlantId || null,
+      } : 'none',
       trips: selectedAnt.trips || 0,
+      navigation: selectedAnt.navigation ? {
+        sectorId: selectedAnt.navigation.sectorId,
+        confidence: Number(selectedAnt.navigation.confidence.toFixed(2)),
+        guidance: selectedAnt.navigation.guidance,
+        learningWalk: Number(selectedAnt.navigation.learningWalk.toFixed(2)),
+        successfulTrips: selectedAnt.navigation.successfulTrips,
+        failedSearches: selectedAnt.navigation.failedSearches,
+        rememberedFood: selectedAnt.navigation.rememberedX == null ? null : {
+          x: Number(selectedAnt.navigation.rememberedX.toFixed(1)),
+          z: Number(selectedAnt.navigation.rememberedZ.toFixed(1)),
+        },
+      } : null,
       following: followingSelected,
     } : null,
     labor: {
@@ -5504,6 +6373,10 @@ window.render_game_to_text = () => {
       focus: focusedColony()?.displayName || 'unregistered colony',
       focusedColonyId: cameraRig.focusedColonyId,
       rivalArchitecture: { tunnels: rivalNestCurves.length, broodVisible: rivalBrood.length, alatesVisible: rivalReproduction.alates.length, queenVisible: true },
+      visibleGranarySeeds: {
+        amber: homeGranaryVisual.count,
+        slate: rivalGranaryVisual.count,
+      },
       completeTunnels: tunnelSegments.filter((segment) => segment.progress >= 0.995).length,
       activeDiggingFronts: tunnelSegments.filter((segment) => segment.available && segment.activeDiggers > 0).length,
       overallConstruction: Number((tunnelSegments.reduce((sum, segment) => sum + segment.progress, 0) / tunnelSegments.length).toFixed(2)),
