@@ -1818,14 +1818,16 @@ function updateRegionalReproductionVisuals(dt) {
     visual.chamber.material.color.setHex(inactiveSite ? 0x413933 : 0x2a1812);
     visual.rim.material.color.setHex(foundation.natalColonyId === RIVAL_COLONY_ID ? 0x7596aa : 0xc28b58);
     visual.rim.material.opacity = inactiveSite ? 0.3 : 0.38 + progress * 0.38;
-    visual.queen.visible = foundation.alive && !inactiveSite;
+    const surfaceQueenVisible = foundation.foundingStage === 'excavating';
+    visual.queen.visible = foundation.alive && !inactiveSite && surfaceQueenVisible;
+    visual.queen.position.y = 0.2 - progress * 0.34;
     visual.queen.material.color.setHex(foundation.natalColonyId === RIVAL_COLONY_ID ? 0x6c8da2 : 0x974838);
     visual.queen.material.rotation = foundation.heading - Math.PI * 0.5;
     for (let j = 0; j < visual.soil.length; j++) visual.soil[j].visible = j < Math.floor(progress * visual.soil.length);
     for (let j = 0; j < visual.brood.length; j++) {
       const item = foundation.foundingBrood?.[j];
       const mesh = visual.brood[j];
-      mesh.visible = Boolean(item);
+      mesh.visible = Boolean(item) && foundation.chamberProgress < 1;
       if (!item) continue;
       const scale = item.stage === 'egg' ? 0.72 : item.stage === 'larva' ? 1 : 1.12;
       mesh.scale.set(scale * (item.stage === 'egg' ? 0.72 : 1), scale, scale * 0.82);
@@ -1835,7 +1837,7 @@ function updateRegionalReproductionVisuals(dt) {
     for (let j = 0; j < visual.nanitics.length; j++) {
       const worker = chamberWorkers[j];
       const sprite = visual.nanitics[j];
-      sprite.visible = Boolean(worker);
+      sprite.visible = Boolean(worker) && foundation.chamberProgress < 1;
       if (!worker) continue;
       const angle = j * 2.399 + simTime * (0.04 + j * 0.003);
       const radius = 0.34 + (j % 3) * 0.1;
@@ -2000,6 +2002,410 @@ function updateRivalUndergroundVisuals() {
   }
   for (let i = visibleTransfers; i < rivalTransferPool.length; i++) rivalTransferPool[i].visible = false;
   updateAlateVisualPool(rivalAlateVisualPool, rivalReproduction.alates, rivalNurseryCenter, { gyne: 0x698ca7, male: 0x899ba3 });
+}
+
+// ---------- Phase 8A: shared, pressure-driven nest architecture ----------
+const colonyNestArchitectures = new Map();
+const architectureChamberGeometry = new THREE.SphereGeometry(1, 18, 12);
+const architectureSpoilGeometry = new THREE.DodecahedronGeometry(0.11, 0);
+const architectureSpoilMaterial = new THREE.MeshStandardMaterial({ color: 0x895a3d, roughness: 1, flatShading: true });
+const architectureSpoil = [];
+const ARCHITECTURE_TYPES = {
+  founding: { capacity: 10, storage: 6, scale: [0.82, 0.43, 0.7], radius: 0.18 },
+  nursery: { capacity: 38, storage: 4, scale: [1.42, 0.56, 1.08], radius: 0.25 },
+  granary: { capacity: 18, storage: 58, scale: [1.25, 0.48, 1.04], radius: 0.23 },
+  resting: { capacity: 30, storage: 8, scale: [1.34, 0.52, 1.1], radius: 0.24 },
+  ventilation: { capacity: 14, storage: 2, scale: [0.9, 0.44, 0.78], radius: 0.2 },
+  shaft: { capacity: 8, storage: 1, scale: [0.72, 0.48, 0.72], radius: 0.28 },
+};
+
+function architectureColor(colony) {
+  return new THREE.Color(colony.color || 0xa86b48);
+}
+
+function createArchitectureNode(architecture, type, position, options = {}) {
+  const profile = ARCHITECTURE_TYPES[type] || ARCHITECTURE_TYPES.resting;
+  const node = {
+    id: `${architecture.colonyId}-chamber-${architecture.nextNodeId++}`,
+    type,
+    position: position.clone(),
+    parentId: options.parentId || null,
+    capacity: options.capacity ?? profile.capacity,
+    storageCapacity: options.storageCapacity ?? profile.storage,
+    completed: options.completed ?? false,
+    children: 0,
+    renderChamber: options.renderChamber !== false,
+    chamber: new THREE.Group(),
+    targetScale: new THREE.Vector3(...profile.scale),
+  };
+  if (node.renderChamber) {
+    node.chamber.add(
+      new THREE.Mesh(architectureChamberGeometry, architecture.fillMaterial),
+      new THREE.Mesh(architectureChamberGeometry, architecture.wireMaterial),
+    );
+    node.chamber.position.copy(node.position);
+    node.chamber.scale.setScalar(node.completed ? 1 : 0.001);
+    architecture.group.add(node.chamber);
+  } else node.chamber.visible = false;
+  architecture.nodes.push(node);
+  return node;
+}
+
+function createArchitectureEdge(architecture, fromNode, toNode, options = {}) {
+  const delta = new THREE.Vector3().subVectors(toNode.position, fromNode.position);
+  const side = new THREE.Vector3(-delta.z, 0, delta.x).normalize().multiplyScalar(options.bend ?? rand(-0.42, 0.42));
+  const points = [
+    fromNode.position.clone(),
+    fromNode.position.clone().lerp(toNode.position, 0.34).add(side),
+    fromNode.position.clone().lerp(toNode.position, 0.68).addScaledVector(side, -0.55),
+    toNode.position.clone(),
+  ];
+  const curve = new THREE.CatmullRomCurve3(points, false, 'catmullrom', 0.42);
+  const radius = ARCHITECTURE_TYPES[toNode.type]?.radius || 0.23;
+  const geometry = new THREE.TubeGeometry(curve, 48, radius, 8, false);
+  const fill = new THREE.Mesh(geometry, architecture.fillMaterial);
+  const wire = new THREE.Mesh(geometry, architecture.wireMaterial);
+  architecture.group.add(fill, wire);
+  const front = new THREE.Mesh(
+    new THREE.IcosahedronGeometry(radius * 0.78, 1),
+    new THREE.MeshBasicMaterial({ color: architecture.color, transparent: true, opacity: 0.66, fog: false }),
+  );
+  architecture.group.add(front);
+  const progress = options.progress ?? 0;
+  const edge = {
+    id: `${architecture.colonyId}-tunnel-${architecture.nextEdgeId++}`,
+    fromNodeId: fromNode.id,
+    toNodeId: toNode.id,
+    curve,
+    geometry,
+    fill,
+    wire,
+    front,
+    progress,
+    workRequired: Math.max(54, curve.getLength() * 31),
+    work: 0,
+    activeDiggers: [],
+    completed: progress >= 1,
+  };
+  edge.work = edge.workRequired * progress;
+  fromNode.children++;
+  architecture.edges.push(edge);
+  return edge;
+}
+
+function createArchitectureWorkerPool(architecture, count = 18) {
+  return Array.from({ length: count }, (_, index) => {
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: antMaterials[index % antMaterials.length].map,
+      color: architecture.color,
+      transparent: true,
+      alphaTest: 0.045,
+      depthWrite: false,
+      depthTest: false,
+      fog: false,
+    }));
+    sprite.visible = false;
+    sprite.renderOrder = 10;
+    architecture.group.add(sprite);
+    return sprite;
+  });
+}
+
+function createArchitectureBroodPool(architecture, count = 18) {
+  return Array.from({ length: count }, () => {
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 8, 5),
+      new THREE.MeshBasicMaterial({ color: 0xead9b7, depthTest: false, fog: false }),
+    );
+    mesh.visible = false;
+    mesh.renderOrder = 9;
+    architecture.group.add(mesh);
+    return mesh;
+  });
+}
+
+function createColonyArchitecture(colony, options = {}) {
+  if (!colony || colonyNestArchitectures.has(colony.id)) return colonyNestArchitectures.get(colony?.id) || null;
+  const color = architectureColor(colony);
+  const group = new THREE.Group();
+  group.name = `${colony.id}-living-architecture`;
+  group.visible = false;
+  undergroundGroup.add(group);
+  const architecture = {
+    colonyId: colony.id,
+    group,
+    color: color.getHex(),
+    fillMaterial: new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.095, side: THREE.DoubleSide, depthWrite: false, fog: false }),
+    wireMaterial: new THREE.MeshBasicMaterial({ color: color.clone().offsetHSL(0.02, -0.05, 0.2), wireframe: true, transparent: true, opacity: 0.42, side: THREE.DoubleSide, depthWrite: false, fog: false }),
+    nodes: [],
+    edges: [],
+    nextNodeId: 1,
+    nextEdgeId: 1,
+    baseChambers: options.baseChambers || 0,
+    baseCapacity: options.baseCapacity || 0,
+    baseStorageCapacity: options.baseStorageCapacity || 0,
+    completedProjects: 0,
+    totalExcavated: 0,
+    spoilDeposits: 0,
+    lastGrowthAt: simTime - 20,
+    growthIndex: 0,
+    occupancy: 0,
+    growthDrive: 0,
+    habitableCapacity: options.baseCapacity || 0,
+    storageCapacity: options.baseStorageCapacity || 0,
+    legacyVisuals: options.legacyVisuals || false,
+    founding: options.founding || false,
+    queenSprite: null,
+    workerPool: null,
+    broodPool: null,
+  };
+  const rootPosition = options.anchor?.clone() || new THREE.Vector3(colony.nest.x, groundHeight(colony.nest.x, colony.nest.y) - 0.05, colony.nest.y);
+  const root = createArchitectureNode(architecture, 'shaft', rootPosition, { completed: true, renderChamber: false, capacity: 0, storageCapacity: 0 });
+  architecture.rootNodeId = root.id;
+  if (architecture.founding) {
+    const chamber = createArchitectureNode(
+      architecture,
+      'founding',
+      new THREE.Vector3(colony.nest.x + 0.14, groundHeight(colony.nest.x, colony.nest.y) - 0.82, colony.nest.y + 0.1),
+      { completed: true, parentId: root.id },
+    );
+    createArchitectureEdge(architecture, root, chamber, { progress: 1, bend: 0.08 });
+    architecture.completedProjects = 1;
+    architecture.lastGrowthAt = simTime;
+    const queenMaterial = new THREE.SpriteMaterial({
+      map: antMaterials[1].map,
+      color,
+      transparent: true,
+      alphaTest: 0.04,
+      depthWrite: false,
+      depthTest: false,
+      fog: false,
+    });
+    architecture.queenSprite = new THREE.Sprite(queenMaterial);
+    architecture.queenSprite.position.copy(chamber.position).add(new THREE.Vector3(-0.15, 0.08, 0));
+    architecture.queenSprite.scale.set(0.82, 0.82, 1);
+    architecture.queenSprite.renderOrder = 10;
+    group.add(architecture.queenSprite);
+  }
+  architecture.workerPool = createArchitectureWorkerPool(architecture);
+  architecture.broodPool = createArchitectureBroodPool(architecture);
+  const light = new THREE.PointLight(color, architecture.founding ? 11 : 8, 9, 2);
+  light.position.copy(rootPosition).add(new THREE.Vector3(0, -1.2, 0));
+  group.add(light);
+  colonyNestArchitectures.set(colony.id, architecture);
+  colony.architecture = architecture;
+  colony.undergroundView = true;
+  colony.undergroundFocusY = architecture.founding ? chamberDepth(architecture) : rootPosition.y;
+  colony.undergroundDistance = architecture.founding ? 7.2 : colony.undergroundDistance || 10.8;
+  return architecture;
+}
+
+function chamberDepth(architecture) {
+  return architecture.nodes.reduce((depth, node) => Math.min(depth, node.position.y), 0);
+}
+
+function architectureNodeById(architecture, id) {
+  return architecture.nodes.find((node) => node.id === id) || null;
+}
+
+function architecturePressure(architecture, colony) {
+  const workers = colony.workers.filter((worker) => worker.alive !== false);
+  const brood = colony.brood || [];
+  architecture.habitableCapacity = architecture.baseCapacity
+    + architecture.nodes.filter((node) => node.completed).reduce((sum, node) => sum + node.capacity, 0);
+  architecture.storageCapacity = architecture.baseStorageCapacity
+    + architecture.nodes.filter((node) => node.completed).reduce((sum, node) => sum + node.storageCapacity, 0);
+  const load = workers.length + brood.length * 0.58;
+  architecture.occupancy = load / Math.max(1, architecture.habitableCapacity);
+  const storagePressure = colony.storedFood / Math.max(1, architecture.storageCapacity);
+  const broodPressure = brood.length / Math.max(1, workers.length * 0.18);
+  architecture.growthDrive = Math.max(architecture.occupancy, storagePressure * 0.76, broodPressure * 0.68);
+  return { workers, brood, storagePressure, broodPressure };
+}
+
+function chooseArchitectureChamberType(architecture, pressure) {
+  if (architecture.growthIndex % 5 === 4) return 'shaft';
+  if (pressure.broodPressure > 0.76) return 'nursery';
+  if (pressure.storagePressure > 0.78) return 'granary';
+  return architecture.growthIndex % 3 === 2 ? 'ventilation' : 'resting';
+}
+
+function startArchitectureProject(architecture, colony, pressure) {
+  const availableParents = architecture.nodes
+    .filter((node) => node.completed && node.renderChamber && node.children < 2)
+    .sort((a, b) => a.children - b.children || a.position.y - b.position.y);
+  const root = architectureNodeById(architecture, architecture.rootNodeId);
+  const parent = availableParents[Math.floor(random() * Math.min(3, availableParents.length))]
+    || architecture.nodes.filter((node) => node.completed).sort((a, b) => a.position.y - b.position.y)[0]
+    || root;
+  const type = chooseArchitectureChamberType(architecture, pressure);
+  let candidate = null;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const angle = architecture.growthIndex * 2.399 + attempt * 0.83 + (colony.id.length % 7) * 0.31;
+    const horizontal = type === 'shaft' ? rand(0.7, 1.35) : rand(2.15, 3.4);
+    const depthDrop = type === 'shaft' ? rand(1.75, 2.5) : rand(0.62, 1.35);
+    const y = parent.position.y < -11.4 ? parent.position.y + rand(0.2, 0.65) : parent.position.y - depthDrop;
+    const trial = new THREE.Vector3(
+      clamp(parent.position.x + Math.cos(angle) * horizontal, -HALF_W + 1, HALF_W - 1),
+      Math.max(-12.4, y),
+      clamp(parent.position.z + Math.sin(angle) * horizontal, -HALF_D + 1, HALF_D - 1),
+    );
+    if (architecture.nodes.every((node) => node.position.distanceTo(trial) > 1.45)) { candidate = trial; break; }
+  }
+  if (!candidate) return null;
+  const node = createArchitectureNode(architecture, type, candidate, { parentId: parent.id });
+  const edge = createArchitectureEdge(architecture, parent, node);
+  if (colony.status !== 'mature') {
+    const youngScale = colony.status === 'young' ? 0.58 : 0.78;
+    node.capacity = Math.max(6, Math.round(node.capacity * youngScale));
+    node.storageCapacity = Math.max(1, Math.round(node.storageCapacity * youngScale));
+    node.targetScale.multiplyScalar(colony.status === 'young' ? 0.74 : 0.86);
+    edge.workRequired *= colony.status === 'young' ? 0.44 : 0.68;
+  }
+  architecture.growthIndex++;
+  architecture.lastGrowthAt = simTime;
+  return edge;
+}
+
+function depositArchitectureSpoil(architecture, colony) {
+  for (let i = 0; i < 5 && architectureSpoil.length < 260; i++) {
+    const angle = (architecture.spoilDeposits * 5 + i) * 2.399;
+    const radius = 0.85 + ((architecture.spoilDeposits + i) % 6) * 0.16;
+    const x = colony.nest.x + Math.cos(angle) * radius;
+    const z = colony.nest.y + Math.sin(angle) * radius * 0.78;
+    const clod = new THREE.Mesh(architectureSpoilGeometry, architectureSpoilMaterial);
+    clod.position.set(x, groundHeight(x, z) + 0.055, z);
+    clod.scale.set(rand(0.48, 1.08), rand(0.36, 0.72), rand(0.5, 1.1));
+    clod.rotation.set(rand(0, Math.PI), rand(0, Math.PI), rand(0, Math.PI));
+    clod.castShadow = clod.receiveShadow = true;
+    surfaceGroup.add(clod);
+    architectureSpoil.push(clod);
+  }
+  architecture.spoilDeposits++;
+}
+
+function updateArchitectureVisual(architecture, colony) {
+  architecture.group.visible = cameraRig.focusedColonyId === architecture.colonyId;
+  let activeEdge = null;
+  for (const edge of architecture.edges) {
+    const count = edge.geometry.index.count;
+    edge.geometry.setDrawRange(0, Math.floor(count * clamp(edge.progress, 0, 1) / 6) * 6);
+    const node = architectureNodeById(architecture, edge.toNodeId);
+    const chamberProgress = clamp((edge.progress - 0.72) / 0.28, 0, 1);
+    if (node?.renderChamber) {
+      node.chamber.visible = chamberProgress > 0 || edge.completed;
+      node.chamber.scale.copy(node.targetScale).multiplyScalar(edge.completed ? 1 : Math.max(0.001, chamberProgress));
+    }
+    edge.front.visible = !edge.completed;
+    if (!edge.completed) {
+      edge.curve.getPointAt(Math.max(0.012, edge.progress), edge.front.position);
+      edge.front.scale.setScalar(0.76 + Math.sin(simTime * 5.2) * 0.18);
+      activeEdge = edge;
+    }
+  }
+
+  const workers = colony.workers.filter((worker) => worker.alive !== false);
+  let visibleWorkers = 0;
+  const assigned = activeEdge ? activeEdge.activeDiggers : [];
+  for (let i = 0; i < assigned.length && visibleWorkers < architecture.workerPool.length; i++) {
+    const worker = assigned[i];
+    const sprite = architecture.workerPool[visibleWorkers++];
+    activeEdge.curve.getPointAt(Math.max(0.012, activeEdge.progress), sprite.position);
+    const angle = i * 2.399 + simTime * 0.8;
+    sprite.position.add(new THREE.Vector3(Math.cos(angle) * 0.22, Math.sin(angle * 1.4) * 0.1, Math.sin(angle) * 0.22));
+    sprite.scale.setScalar((worker.size || 0.8) * 0.38);
+    sprite.material.rotation = angle;
+    sprite.visible = true;
+  }
+  if (!architecture.legacyVisuals) {
+    const chamberNodes = architecture.nodes.filter((node) => node.completed && node.renderChamber);
+    for (let i = 0; i < workers.length && visibleWorkers < architecture.workerPool.length && chamberNodes.length > 0; i++) {
+      const worker = workers[i];
+      if (assigned.includes(worker)) continue;
+      const sprite = architecture.workerPool[visibleWorkers++];
+      const node = chamberNodes[i % chamberNodes.length];
+      const angle = i * 2.399 + simTime * (0.03 + (i % 4) * 0.008);
+      sprite.position.copy(node.position).add(new THREE.Vector3(Math.cos(angle) * 0.42, Math.sin(simTime + i) * 0.08, Math.sin(angle) * 0.3));
+      sprite.scale.setScalar((worker.size || 0.72) * 0.36);
+      sprite.material.rotation = -angle;
+      sprite.visible = true;
+    }
+  }
+  for (let i = visibleWorkers; i < architecture.workerPool.length; i++) architecture.workerPool[i].visible = false;
+
+  const brood = colony.brood || [];
+  const nurseryNodes = architecture.nodes.filter((node) => node.completed && (node.type === 'nursery' || node.type === 'founding'));
+  let visibleBrood = 0;
+  if (!architecture.legacyVisuals && nurseryNodes.length > 0) for (let i = 0; i < brood.length && visibleBrood < architecture.broodPool.length; i++) {
+    const item = brood[i];
+    const mesh = architecture.broodPool[visibleBrood++];
+    const node = nurseryNodes[i % nurseryNodes.length];
+    const angle = i * 2.399;
+    mesh.position.copy(node.position).add(new THREE.Vector3(Math.cos(angle) * 0.34, -0.1 + Math.sin(i) * 0.05, Math.sin(angle) * 0.24));
+    const scale = item.stage === 'egg' ? 0.075 : item.stage === 'larva' ? 0.105 : 0.13;
+    mesh.scale.set(scale, scale * (item.stage === 'egg' ? 1.35 : 0.72), scale * 0.82);
+    mesh.material.color.setHex(item.stage === 'egg' ? 0xeee2c6 : item.stage === 'larva' ? 0xd9c59f : 0xb99b78);
+    mesh.visible = true;
+  }
+  for (let i = visibleBrood; i < architecture.broodPool.length; i++) architecture.broodPool[i].visible = false;
+  if (architecture.queenSprite) architecture.queenSprite.visible = colony.queen?.alive !== false;
+}
+
+function updateColonyArchitectures(dt) {
+  for (const architecture of colonyNestArchitectures.values()) {
+    const colony = getColony(architecture.colonyId);
+    if (!colony || colony.status === 'extinct') { architecture.group.visible = false; continue; }
+    const pressure = architecturePressure(architecture, colony);
+    let activeEdge = architecture.edges.find((edge) => !edge.completed) || null;
+    const canExpand = colony.status === 'mature' || colony.status === 'young' || colony.status === 'established';
+    const interval = colony.status === 'mature' ? 9 : 14;
+    if (!activeEdge && canExpand && architecture.nodes.length < 50
+      && simTime - architecture.lastGrowthAt > interval && architecture.growthDrive > 0.64) {
+      activeEdge = startArchitectureProject(architecture, colony, pressure);
+    }
+    if (activeEdge) {
+      const desired = clamp(Math.ceil(pressure.workers.length * (colony.status === 'mature' ? 0.038 : 0.09)), 1, 12);
+      const candidates = pressure.workers
+        .filter((worker) => !worker.carrying && !worker.transferCargo && !worker.sanitationCargo)
+        .sort((a, b) => Number(Boolean(b.insideNest)) - Number(Boolean(a.insideNest))
+          || Number((b.assignedRole || b.role) === 'excavator') - Number((a.assignedRole || a.role) === 'excavator')
+          || (b.energy || 50) - (a.energy || 50));
+      activeEdge.activeDiggers = candidates.slice(0, desired);
+      const labor = activeEdge.activeDiggers.reduce((sum, worker) => sum
+        + (worker.genome?.speed || 1) * (worker.genome?.size || 1) * (0.58 + (worker.energy || 50) * 0.004), 0);
+      const foodFactor = clamp((colony.storedFood - 2) / 28, colony.status === 'mature' ? 0.16 : 0.3, 1);
+      const seasonFactor = environment.season.name === 'winter' ? 0.46 : environment.season.name === 'autumn' ? 0.82 : 1;
+      const work = dt * labor * foodFactor * seasonFactor;
+      activeEdge.work = Math.min(activeEdge.workRequired, activeEdge.work + work);
+      activeEdge.progress = clamp(activeEdge.work / activeEdge.workRequired, 0.012, 1);
+      architecture.totalExcavated += work;
+      for (const worker of activeEdge.activeDiggers) worker.architectureAssignment = activeEdge.id;
+      if (activeEdge.progress >= 1) {
+        activeEdge.completed = true;
+        activeEdge.activeDiggers.forEach((worker) => { worker.architectureAssignment = null; });
+        activeEdge.activeDiggers = [];
+        const node = architectureNodeById(architecture, activeEdge.toNodeId);
+        if (node) node.completed = true;
+        architecture.completedProjects++;
+        architecture.lastGrowthAt = simTime;
+        depositArchitectureSpoil(architecture, colony);
+        createSignal(colony.nest.x, colony.nest.y, architecture.color);
+      }
+    }
+    colony.undergroundFocusY = Math.max(-9.2, chamberDepth(architecture) * 0.72);
+    colony.undergroundDistance = architecture.founding
+      ? clamp(4.45 + architecture.nodes.length * 0.34, 5.35, 9.4)
+      : clamp(6.8 + (architecture.baseChambers + architecture.nodes.length) * 0.72, 7.2, 14.5);
+    if (cameraRig.focusedColonyId === colony.id && cameraRig.desiredPitch < -0.1) {
+      const centroid = architecture.nodes.reduce((sum, node) => sum.add(node.position), new THREE.Vector3())
+        .multiplyScalar(1 / Math.max(1, architecture.nodes.length));
+      const follow = Math.min(1, dt * 0.9);
+      cameraRig.target.x += (centroid.x - cameraRig.target.x) * follow;
+      cameraRig.target.z += (centroid.z - cameraRig.target.z) * follow;
+      cameraRig.desiredDistance += (colony.undergroundDistance - cameraRig.desiredDistance) * follow;
+    }
+    updateArchitectureVisual(architecture, colony);
+  }
 }
 
 undergroundGroup.add(new THREE.AmbientLight(0x9a735a, 1.2));
@@ -2834,6 +3240,9 @@ function registerFoundingColony(queen) {
     get deaths() { return queen.foundingDeaths; },
   });
   queen.foundingStage = 'incipient';
+  const architecture = createColonyArchitecture(record, { founding: true, baseCapacity: 0, baseStorageCapacity: 0 });
+  queen.architectureId = architecture?.colonyId || null;
+  if (requestedNestFocus === 'young') focusCameraOnColony(record, true);
   queen.state = 'first nanitic eclosed · incipient colony registered';
   recordLineageEvent('colony-registered', queen, { status: 'incipient', workers: queen.nanitics.length });
   createSignal(queen.x, queen.z, 0xf1c776);
@@ -3966,6 +4375,21 @@ const rivalColonyRecord = registerColony({
   get deaths() { return rivalColony.deaths; },
 });
 
+createColonyArchitecture(homeColonyRecord, {
+  anchor: tunnelSegments[3].curve.getPointAt(1),
+  baseChambers: 4,
+  baseCapacity: 150,
+  baseStorageCapacity: 118,
+  legacyVisuals: true,
+});
+createColonyArchitecture(rivalColonyRecord, {
+  anchor: rivalNestCurves[0].getPointAt(1),
+  baseChambers: 4,
+  baseCapacity: 76,
+  baseStorageCapacity: 88,
+  legacyVisuals: true,
+});
+
 function focusedColony() {
   return getColony(cameraRig.focusedColonyId) || homeColonyRecord;
 }
@@ -3973,8 +4397,18 @@ function focusedColony() {
 function focusCameraOnColony(colony, underground = true) {
   if (!colony) return;
   cameraRig.focusedColonyId = colony.id;
-  cameraRig.target.x = colony.nest.x + colony.focusOffset.x;
-  cameraRig.target.z = colony.nest.y + colony.focusOffset.y;
+  const architecture = colony.architecture;
+  const useArchitectureFocus = architecture && (underground || cameraRig.desiredPitch < -0.1);
+  if (useArchitectureFocus) {
+    const focusNodes = architecture.nodes;
+    const centroid = focusNodes.reduce((sum, node) => sum.add(node.position), new THREE.Vector3()).multiplyScalar(1 / Math.max(1, focusNodes.length));
+    cameraRig.target.x = centroid.x;
+    cameraRig.target.z = centroid.z;
+    if (architecture.founding && underground) cameraRig.yaw = 1.22;
+  } else {
+    cameraRig.target.x = colony.nest.x + colony.focusOffset.x;
+    cameraRig.target.z = colony.nest.y + colony.focusOffset.y;
+  }
   if (underground && colony.undergroundView !== false) {
     cameraRig.desiredPitch = -0.32;
     cameraRig.desiredDistance = colony.undergroundDistance || 10.8;
@@ -5559,6 +5993,7 @@ function update(dt) {
   updateLaborAssignments(dt);
   updateColonyBiology(dt);
   updateRivalColony(dt);
+  updateColonyArchitectures(dt);
   rebuildAntSpatialGrid();
   for (const ant of ants) updateAnt(ant, dt);
   removeDeadWorkers();
@@ -5909,6 +6344,7 @@ function registeredColonySummary(colony) {
     } : null,
     foragingNetwork: foragingNetworkSummary(colony.foragingNetwork),
     seedBank: seedBankSummary(colony.seedBank),
+    architecture: colonyArchitectureSummary(colony.architecture),
     workersEclosed: colony.workersEclosed,
     deaths: colony.deaths,
     genetics: {
@@ -5962,6 +6398,39 @@ function seedBankSummary(bank) {
     sproutedInStore: Number(bank.sproutedInStore.toFixed(1)),
     overflowDiscarded: bank.overflowDiscarded,
     species: Object.fromEntries(Object.entries(bank.species).map(([species, count]) => [species, Number(count.toFixed(1))])),
+  };
+}
+
+function colonyArchitectureSummary(architecture) {
+  if (!architecture) return null;
+  const active = architecture.edges.find((edge) => !edge.completed) || null;
+  return {
+    system: 'shared pressure-driven nest graph',
+    baseChambers: architecture.baseChambers,
+    completedNewChambers: architecture.nodes.filter((node) => node.renderChamber && node.completed).length,
+    activeGrowthFronts: active ? 1 : 0,
+    habitableCapacity: Math.round(architecture.habitableCapacity),
+    storageCapacity: Math.round(architecture.storageCapacity),
+    occupancy: Number(architecture.occupancy.toFixed(2)),
+    growthDrive: Number(architecture.growthDrive.toFixed(2)),
+    deepestDepth: Number(chamberDepth(architecture).toFixed(2)),
+    totalExcavated: Number(architecture.totalExcavated.toFixed(1)),
+    spoilDeposits: architecture.spoilDeposits,
+    activeProject: active ? {
+      id: active.id,
+      chamberType: architectureNodeById(architecture, active.toNodeId)?.type || 'unknown',
+      progress: Number(active.progress.toFixed(2)),
+      workerIds: active.activeDiggers.map((worker) => workerDisplayId(worker)),
+    } : null,
+    chambers: architecture.nodes.filter((node) => node.renderChamber).map((node) => ({
+      id: node.id,
+      type: node.type,
+      completed: node.completed,
+      capacity: node.capacity,
+      x: Number(node.position.x.toFixed(1)),
+      y: Number(node.position.y.toFixed(1)),
+      z: Number(node.position.z.toFixed(1)),
+    })),
   };
 }
 
@@ -6372,6 +6841,7 @@ window.render_game_to_text = () => {
     underground: {
       focus: focusedColony()?.displayName || 'unregistered colony',
       focusedColonyId: cameraRig.focusedColonyId,
+      livingArchitecture: colonyArchitectureSummary(focusedColony()?.architecture),
       rivalArchitecture: { tunnels: rivalNestCurves.length, broodVisible: rivalBrood.length, alatesVisible: rivalReproduction.alates.length, queenVisible: true },
       visibleGranarySeeds: {
         amber: homeGranaryVisual.count,
