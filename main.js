@@ -17,9 +17,23 @@ const HOME_COLONY_ID = 'amber';
 const RIVAL_COLONY_ID = 'slate';
 const SPECIES_PROFILE = 'harvester-ant reference population';
 const FIXED_DT = 1 / 30;
-const MAX_ANTS = 260;
-const MAX_RIVALS = 120;
-const MAX_ACTIVE_WORKERS = 420;
+const SEASON_SECONDS = 92;
+const ECOLOGICAL_YEAR_SECONDS = SEASON_SECONDS * 4;
+const SIM_DAYS_PER_SECOND = 365 / ECOLOGICAL_YEAR_SECONDS;
+// P. barbatus workers generally turn over within an ecological year. Damage is
+// gradual rather than a birthday-triggered deletion so protected interior work
+// still carries a measurable longevity advantage over exterior work.
+const WORKER_SENESCENCE_DAYS = 42;
+const WORKER_SENESCENCE_RATE = 0.0022;
+// These are deliberately high engine safeguards, not biological population
+// targets. Colony size is regulated below by food, brood space, queen rate,
+// crowding, and mortality.
+const TECHNICAL_HOME_WORKER_LIMIT = 900;
+const TECHNICAL_RIVAL_WORKER_LIMIT = 900;
+const TECHNICAL_DESCENDANT_WORKER_LIMIT = 600;
+const TECHNICAL_GLOBAL_WORKER_LIMIT = 1800;
+const TECHNICAL_BROOD_LIMIT = 420;
+const UNDERGROUND_WORKER_RENDER_LIMIT = 260;
 const PHER_W = 92;
 const PHER_H = 70;
 let selectedAnt = null;
@@ -52,8 +66,21 @@ function livingColonies() {
 
 function totalActiveWorkers() {
   let total = 0;
-  for (const colony of colonyRegistry.values()) total += colony.workers.length;
+  for (const colony of colonyRegistry.values()) {
+    total += colony.workers.reduce((count, worker) => count + Number(worker.alive !== false), 0);
+  }
   return total;
+}
+
+function colonyTechnicalWorkerLimit(colonyId) {
+  if (colonyId === HOME_COLONY_ID) return TECHNICAL_HOME_WORKER_LIMIT;
+  if (colonyId === RIVAL_COLONY_ID) return TECHNICAL_RIVAL_WORKER_LIMIT;
+  return TECHNICAL_DESCENDANT_WORKER_LIMIT;
+}
+
+function hasTechnicalWorkerRoom(colonyId, currentWorkers) {
+  return currentWorkers < colonyTechnicalWorkerLimit(colonyId)
+    && totalActiveWorkers() < TECHNICAL_GLOBAL_WORKER_LIMIT;
 }
 
 function workerDisplayId(worker) {
@@ -468,8 +495,15 @@ function createForagingNetwork(colonyId, nest, color) {
       failures: 0,
       discoveries: 0,
       activeForagers: 0,
+      pendingRecruits: 0,
+      availableFood: 0,
+      resourceSites: 0,
+      recruitmentCapacity: 3,
+      congestion: 0,
+      stale: false,
       centroidX: nest.x,
       centroidZ: nest.y,
+      lastDiscoveryAt: null,
       lastSuccessAt: null,
       trunkStrength: 0,
     })),
@@ -477,6 +511,12 @@ function createForagingNetwork(colonyId, nest, color) {
     learningWalksCompleted: 0,
     memoryGuidedSteps: 0,
     socialGuidedSteps: 0,
+    localSearchSteps: 0,
+    exploratorySteps: 0,
+    congestionReroutes: 0,
+    staleMemoriesExpired: 0,
+    peakSectorShare: 0,
+    currentPeakSectorShare: 0,
   };
   colonyForagingNetworks.set(colonyId, network);
   return network;
@@ -499,27 +539,67 @@ function ensureWorkerNavigation(worker, experienced = false) {
     successfulTrips: 0,
     failedSearches: 0,
     searchTime: 0,
+    emptySectorTime: 0,
     learningWalk: experienced ? 1 : 0,
     guidance: experienced ? 'mixed' : 'learning walk',
+    rememberedFood: null,
+    memoryUpdatedAt: null,
+    memoryLifetime: rand(11, 19),
+    sectorCommitUntil: 0,
+    localTargetX: null,
+    localTargetZ: null,
+    targetRefreshAt: 0,
+    waypointIndex: Math.floor(rand(0, 24)),
   };
+  worker.navigation.emptySectorTime ??= 0;
+  worker.navigation.rememberedFood ??= null;
+  worker.navigation.memoryUpdatedAt ??= null;
+  worker.navigation.memoryLifetime ??= rand(11, 19);
+  worker.navigation.sectorCommitUntil ??= 0;
+  worker.navigation.localTargetX ??= null;
+  worker.navigation.localTargetZ ??= null;
+  worker.navigation.targetRefreshAt ??= 0;
+  worker.navigation.waypointIndex ??= Math.floor(rand(0, 24));
   return worker.navigation;
 }
 
 function chooseForagingSector(worker, network, forceSwitch = false) {
   const navigation = ensureWorkerNavigation(worker);
-  if (!forceSwitch && navigation.sectorId != null) return network.sectors[navigation.sectorId];
+  const current = navigation.sectorId == null ? null : network.sectors[navigation.sectorId];
+  const currentCongested = current && current.congestion > 1.08;
+  const currentStale = current && current.stale;
+  if (!forceSwitch && current && simTime < navigation.sectorCommitUntil && !currentStale) return current;
+  if (!forceSwitch && current && !currentCongested && !currentStale && random() > 0.035) {
+    navigation.sectorCommitUntil = simTime + rand(2.5, 5.5);
+    return current;
+  }
   let best = null;
   let bestScore = -Infinity;
+  const explorer = ((worker.id * 7 + network.colonyId.length * 3) % 13) < 2;
   for (const sector of network.sectors) {
-    const privateFamiliarity = navigation.sectorId === sector.id ? navigation.confidence * 1.8 : 0;
-    const score = sector.socialPulse * 1.5 + sector.confidence * 0.85 + sector.trunkStrength * 0.7
-      + privateFamiliarity - sector.failures * 0.035 + rand(-0.18, 0.18);
+    const anticipatedTraffic = sector.activeForagers + sector.pendingRecruits;
+    const anticipatedCongestion = anticipatedTraffic / Math.max(1, sector.recruitmentCapacity);
+    const privateFamiliarity = navigation.sectorId === sector.id
+      ? navigation.confidence * 1.8 * clamp(1.35 - anticipatedCongestion, 0.08, 1) : 0;
+    const resourceSignal = (Math.log1p(sector.availableFood) * 0.38 + sector.resourceSites * 0.11) * (explorer ? 0.15 : 1);
+    const explorationBonus = sector.discoveries === 0 ? (explorer ? 2.25 : 0.2) : sector.stale ? (explorer ? 1.45 : 0.12) : 0;
+    const socialSignal = sector.stale ? 0 : (sector.socialPulse * 1.2 + sector.trunkStrength * 0.62) * (explorer ? 0.15 : 1);
+    const score = resourceSignal + socialSignal + sector.confidence * 0.55 + privateFamiliarity
+      + explorationBonus - anticipatedCongestion * 1.72 - sector.failures * 0.025
+      - (forceSwitch && current?.id === sector.id ? 1.8 : 0) + rand(-0.26, 0.26);
     if (score > bestScore) { bestScore = score; best = sector; }
   }
-  if (navigation.sectorId != null && best && navigation.sectorId !== best.id) network.routeSwitches++;
+  if (current && best && current.id !== best.id) {
+    network.routeSwitches++;
+    if (currentCongested) network.congestionReroutes++;
+  }
   navigation.sectorId = best?.id ?? 0;
   navigation.failedSearches = 0;
   navigation.searchTime = 0;
+  navigation.emptySectorTime = 0;
+  navigation.sectorCommitUntil = simTime + rand(5.5, 12.5);
+  navigation.targetRefreshAt = 0;
+  if (best) best.pendingRecruits++;
   return best || network.sectors[0];
 }
 
@@ -532,10 +612,16 @@ function recordFoodDiscovery(worker, food) {
   navigation.sectorId = sectorId;
   navigation.rememberedX = food.x;
   navigation.rememberedZ = food.z;
+  navigation.rememberedFood = food;
+  navigation.memoryUpdatedAt = simTime;
+  navigation.memoryLifetime = rand(11, 19);
   navigation.confidence = clamp(navigation.confidence + 0.18 * food.nutrition, 0, 1);
   navigation.searchTime = 0;
+  navigation.emptySectorTime = 0;
   navigation.failedSearches = 0;
+  navigation.sectorCommitUntil = simTime + rand(7, 14);
   sector.discoveries++;
+  sector.lastDiscoveryAt = simTime;
   const weight = Math.min(8, sector.discoveries);
   sector.centroidX += (food.x - sector.centroidX) / weight;
   sector.centroidZ += (food.z - sector.centroidZ) / weight;
@@ -562,6 +648,7 @@ function recordForagingFailure(worker) {
   if (!network || navigation.sectorId == null) return;
   const sector = network.sectors[navigation.sectorId];
   navigation.failedSearches++;
+  navigation.emptySectorTime = 0;
   navigation.confidence = Math.max(0, navigation.confidence - 0.13);
   sector.failures++;
   sector.confidence = Math.max(0.02, sector.confidence - 0.035);
@@ -573,6 +660,77 @@ function sectorTarget(network, sector) {
   if (sector.discoveries > 0) return { x: sector.centroidX, z: sector.centroidZ };
   const radius = 7.5 + (sector.id % 3) * 1.4;
   return { x: network.nest.x + Math.cos(sector.angle) * radius, z: network.nest.y + Math.sin(sector.angle) * radius };
+}
+
+function expireStaleForagingMemory(worker, network) {
+  const navigation = ensureWorkerNavigation(worker);
+  if (navigation.rememberedX == null) return false;
+  const rememberedSourceGone = navigation.rememberedFood && navigation.rememberedFood.amount <= 0;
+  const memoryAge = simTime - (navigation.memoryUpdatedAt ?? simTime);
+  if (!rememberedSourceGone || memoryAge < navigation.memoryLifetime) return false;
+  navigation.rememberedX = null;
+  navigation.rememberedZ = null;
+  navigation.rememberedFood = null;
+  navigation.memoryUpdatedAt = null;
+  navigation.confidence *= 0.42;
+  navigation.targetRefreshAt = 0;
+  network.staleMemoriesExpired++;
+  return true;
+}
+
+function liveFoodsInSector(network, sector) {
+  return foods.filter((food) => food.amount > 0 && sectorForPoint(network, food.x, food.z) === sector.id);
+}
+
+function foragingSearchTarget(worker, network, sector, forceRefresh = false) {
+  const navigation = ensureWorkerNavigation(worker);
+  const reachedTarget = navigation.localTargetX != null
+    && Math.hypot(worker.x - navigation.localTargetX, worker.z - navigation.localTargetZ) < 0.48;
+  if (!forceRefresh && navigation.localTargetX != null && !reachedTarget && simTime < navigation.targetRefreshAt) {
+    return { x: navigation.localTargetX, z: navigation.localTargetZ };
+  }
+
+  const sources = liveFoodsInSector(network, sector);
+  navigation.waypointIndex++;
+  if (sources.length > 0) {
+    const offset = navigation.waypointIndex % sources.length;
+    const ranked = [...sources].sort((a, b) => {
+      const scoreA = Math.log1p(a.amount) * a.nutrition - Math.hypot(a.x - worker.x, a.z - worker.z) * 0.06;
+      const scoreB = Math.log1p(b.amount) * b.nutrition - Math.hypot(b.x - worker.x, b.z - worker.z) * 0.06;
+      return scoreB - scoreA;
+    });
+    const source = ranked[offset];
+    const fanAngle = (worker.id * 2.399 + navigation.waypointIndex * 1.17) % (Math.PI * 2);
+    const fanRadius = 0.12 + (navigation.waypointIndex % 4) * 0.09;
+    navigation.localTargetX = clamp(source.x + Math.cos(fanAngle) * fanRadius, -HALF_W + 0.45, HALF_W - 0.45);
+    navigation.localTargetZ = clamp(source.z + Math.sin(fanAngle) * fanRadius, -HALF_D + 0.45, HALF_D - 0.45);
+    navigation.targetRefreshAt = simTime + rand(2.6, 5.8);
+  } else {
+    const center = sectorTarget(network, sector);
+    const fanAngle = sector.angle + ((worker.id * 0.7549 + navigation.waypointIndex * 1.618) % 1.9) - 0.95;
+    const fanRadius = 0.75 + (navigation.waypointIndex % 6) * 0.46 + rand(0, 0.38);
+    navigation.localTargetX = clamp(center.x + Math.cos(fanAngle) * fanRadius, -HALF_W + 0.45, HALF_W - 0.45);
+    navigation.localTargetZ = clamp(center.z + Math.sin(fanAngle) * fanRadius, -HALF_D + 0.45, HALF_D - 0.45);
+    navigation.targetRefreshAt = simTime + rand(2.2, 4.8);
+  }
+  return { x: navigation.localTargetX, z: navigation.localTargetZ };
+}
+
+function advanceForagingSearch(worker, network, sector, dt) {
+  const navigation = ensureWorkerNavigation(worker);
+  navigation.searchTime += dt;
+  network.localSearchSteps += dt;
+  if (sector.availableFood <= 0) {
+    navigation.emptySectorTime += dt;
+    network.exploratorySteps += dt;
+  } else navigation.emptySectorTime = Math.max(0, navigation.emptySectorTime - dt * 2.4);
+  if (navigation.emptySectorTime > 8 || navigation.searchTime > 24) {
+    recordForagingFailure(worker);
+    navigation.searchTime = 0;
+    navigation.targetRefreshAt = 0;
+    return true;
+  }
+  return false;
 }
 
 const trunkRouteVisualPool = Array.from({ length: 24 }, () => {
@@ -610,17 +768,54 @@ function updateForagingNetworks(dt) {
   let routeMarker = 0;
   for (const network of colonyForagingNetworks.values()) {
     for (const sector of network.sectors) {
-      sector.socialPulse = Math.max(0, sector.socialPulse - dt * (0.025 + weather.rain * 0.03));
-      sector.trunkStrength = Math.max(0, sector.trunkStrength - dt * (0.0012 + weather.rain * 0.0025));
-      sector.confidence = Math.max(0.02, sector.confidence - dt * 0.00055);
       sector.activeForagers = 0;
+      sector.pendingRecruits = 0;
+      sector.availableFood = 0;
+      sector.resourceSites = 0;
+    }
+    const liveCentroids = new Map();
+    for (const food of foods) {
+      if (food.amount <= 0) continue;
+      const sector = network.sectors[sectorForPoint(network, food.x, food.z)];
+      sector.availableFood += food.amount;
+      sector.resourceSites++;
+      const entry = liveCentroids.get(sector.id) || { x: 0, z: 0, weight: 0 };
+      const weight = Math.max(1, Math.sqrt(food.amount));
+      entry.x += food.x * weight;
+      entry.z += food.z * weight;
+      entry.weight += weight;
+      liveCentroids.set(sector.id, entry);
+    }
+    for (const sector of network.sectors) {
+      const live = liveCentroids.get(sector.id);
+      if (live) {
+        sector.centroidX = live.x / live.weight;
+        sector.centroidZ = live.z / live.weight;
+      }
+      const lastEvidence = Math.max(sector.lastDiscoveryAt ?? -Infinity, sector.lastSuccessAt ?? -Infinity);
+      sector.stale = sector.discoveries > 0 && sector.availableFood <= 0 && simTime - lastEvidence > 14;
+      const staleMultiplier = sector.stale ? 7.5 : 1;
+      sector.socialPulse = Math.max(0, sector.socialPulse - dt * (0.025 + weather.rain * 0.03) * staleMultiplier);
+      sector.trunkStrength = Math.max(0, sector.trunkStrength - dt * (0.0012 + weather.rain * 0.0025) * staleMultiplier);
+      sector.confidence = Math.max(0.02, sector.confidence - dt * (sector.stale ? 0.009 : 0.00055));
+      sector.recruitmentCapacity = Math.max(3, Math.ceil(2.5 + Math.sqrt(sector.availableFood) * 1.55
+        + sector.resourceSites * 1.6 + sector.trunkStrength * 5));
     }
     const colony = getColony(network.colonyId);
     if (colony) for (const worker of colony.workers) {
       if (!worker.alive || worker.insideNest) continue;
+      if (worker.carrying || worker.soilCargo || worker.sanitationCargo || worker.transferCargo) continue;
+      if (colony.status === 'mature' && ['nurse', 'transfer', 'excavator', 'sanitizer'].includes(worker.assignedRole || worker.role)) continue;
       const navigation = ensureWorkerNavigation(worker, worker.generation === 0);
       if (navigation.sectorId != null) network.sectors[navigation.sectorId].activeForagers++;
     }
+    const activeTotal = network.sectors.reduce((sum, sector) => sum + sector.activeForagers, 0);
+    network.currentPeakSectorShare = 0;
+    for (const sector of network.sectors) {
+      sector.congestion = sector.activeForagers / Math.max(1, sector.recruitmentCapacity);
+      if (activeTotal > 0) network.currentPeakSectorShare = Math.max(network.currentPeakSectorShare, sector.activeForagers / activeTotal);
+    }
+    if (activeTotal >= 8) network.peakSectorShare = Math.max(network.currentPeakSectorShare, network.peakSectorShare - dt * 0.006);
     const trunks = network.sectors.filter((sector) => sector.successes >= 2 && sector.trunkStrength > 0.08)
       .sort((a, b) => b.trunkStrength - a.trunkStrength).slice(0, 3);
     for (const sector of trunks) {
@@ -707,7 +902,9 @@ const foods = [];
 const signals = [];
 let simTime = 0;
 let delivered = 0;
-let storedFood = 118;
+const demographicScenario = new URLSearchParams(window.location.search).get('demography');
+const RESOURCE_ABUNDANCE_FACTOR = demographicScenario === 'abundance' ? 1.65 : 1;
+let storedFood = demographicScenario === 'scarcity' ? 2.5 : demographicScenario === 'abundance' ? 260 : 118;
 const FOOD_NUTRITION = { crumb: 0.72, seed: 1.0, berry: 1.28, beetle: 1.55 };
 const SEASONS = [
   { name: 'spring', food: 1.18, rain: 1.35, tint: 0xdce8bd },
@@ -716,6 +913,15 @@ const SEASONS = [
   { name: 'winter', food: 0.36, rain: 1.12, tint: 0xbccad0 },
 ];
 const environment = { seasonIndex: 0, seasonProgress: 0, season: SEASONS[0], pressure: 'stable' };
+const ecologicalBalance = {
+  nextCheckpointAt: 0,
+  samples: [],
+  depletedFoodRetired: 0,
+  storageOverflow: new Map(),
+  storedFoodSpoiled: new Map(),
+  storedFoodMetabolized: new Map(),
+  annualFlightWindows: new Map(),
+};
 const urlParams = new URLSearchParams(window.location.search);
 const requestedSeasonOffset = clamp(Number(urlParams.get('season')) || 0, 0, SEASONS.length - 1);
 const predatorsDisabled = urlParams.get('predator') === '0';
@@ -737,6 +943,7 @@ function addFood(x, z, kind = 'crumb', amount = 52, size = 1.5, ecology = {}) {
     x, z, kind, amount, initial: amount, size, mesh,
     nutrition: FOOD_NUTRITION[kind] || 0.8,
     createdAt: simTime,
+    depletedAt: null,
     ecologySource: ecology.source || 'incidental',
     sourcePlantId: ecology.sourcePlantId || null,
     seedSpecies: ecology.seedSpecies || null,
@@ -763,16 +970,19 @@ function removeFoodUnits(food, amount = 1, cause = 'ant harvest') {
   }
   if (food.amount <= 0) {
     food.amount = 0;
+    food.depletedAt ??= simTime;
     food.mesh.visible = false;
     createSignal(food.x, food.z, cause === 'ant harvest' ? 0x9f9a58 : 0x88483d);
   }
   return removed;
 }
 
-addFood(7.4, -4.8, 'seed', 62, 1.55);
-addFood(4.7, 5.4, 'crumb', 78, 1.75);
-addFood(-1.2, 7.6, 'beetle', 115, 2.05);
-addFood(11.7, 5.4, 'berry', 90, 1.8);
+if (demographicScenario !== 'scarcity') {
+  addFood(7.4, -4.8, 'seed', Math.round(62 * RESOURCE_ABUNDANCE_FACTOR), 1.55);
+  addFood(4.7, 5.4, 'crumb', Math.round(78 * RESOURCE_ABUNDANCE_FACTOR), 1.75);
+  addFood(-1.2, 7.6, 'beetle', Math.round(115 * RESOURCE_ABUNDANCE_FACTOR), 2.05);
+  addFood(11.7, 5.4, 'berry', Math.round(90 * RESOURCE_ABUNDANCE_FACTOR), 1.8);
+}
 
 // ---------- renewable seed landscape and colony granaries ----------
 const PLANT_PROFILES = {
@@ -1022,7 +1232,7 @@ function updateColonySeedBanks(dt) {
 }
 
 function updateVegetationEcology(dt) {
-  const seasonKey = Math.floor(simTime / 92);
+  const seasonKey = Math.floor(simTime / SEASON_SECONDS);
   const activePlantCrops = () => foods.filter((food) => food.amount > 0 && food.ecologySource === 'plant seedfall').length;
   for (const plant of vegetationEcology.plants) {
     if (!plant.alive) continue;
@@ -1049,9 +1259,11 @@ function updateVegetationEcology(dt) {
       }
     }
 
-    if (plant.maturity > 0.54 && plantSeedWindow(plant) && plant.producedSeasonKey !== seasonKey && activePlantCrops() < 10) {
+    if (demographicScenario !== 'scarcity' && plant.maturity > 0.54 && plantSeedWindow(plant)
+      && plant.producedSeasonKey !== seasonKey && activePlantCrops() < (demographicScenario === 'abundance' ? 14 : 10)) {
       const profile = PLANT_PROFILES[plant.species];
-      const crop = Math.max(6, Math.round(profile.maxCrop * plant.maturity * plant.health * rand(0.72, 1.12)));
+      const crop = Math.max(6, Math.round(profile.maxCrop * plant.maturity * plant.health
+        * rand(0.72, 1.12) * RESOURCE_ABUNDANCE_FACTOR));
       const angle = rand(0, Math.PI * 2);
       const food = addFood(
         plant.x + Math.cos(angle) * rand(0.28, 0.55),
@@ -1072,6 +1284,7 @@ function updateVegetationEcology(dt) {
     const returned = Math.max(1, Math.round(food.amount * 0.34));
     addSoilSeedCohort(food.x, food.z, food.seedSpecies, returned, { sourcePlantId: food.sourcePlantId, viability: rand(0.58, 0.92) });
     food.amount = 0;
+    food.depletedAt = simTime;
     food.mesh.visible = false;
   }
 
@@ -1097,6 +1310,16 @@ function updateVegetationEcology(dt) {
     if (vegetationEcology.soilSeeds[i].viability <= 0.05) vegetationEcology.soilSeeds.splice(i, 1);
   }
   updateColonySeedBanks(dt);
+}
+
+function retireDepletedFoodRecords() {
+  for (let i = foods.length - 1; i >= 0; i--) {
+    const food = foods[i];
+    if (food.amount > 0 || food.depletedAt == null || simTime - food.depletedAt < 54) continue;
+    food.mesh.parent?.remove(food.mesh);
+    foods.splice(i, 1);
+    ecologicalBalance.depletedFoodRetired++;
+  }
 }
 
 const initialPlantSpecies = ['needlegrass', 'needlegrass', 'desertForb', 'saltbush'];
@@ -1181,7 +1404,7 @@ const spider = {
 const antGeometry = new THREE.PlaneGeometry(0.94, 0.94);
 antGeometry.rotateX(-Math.PI / 2);
 const antMeshes = antMaterials.map((material) => {
-  const mesh = new THREE.InstancedMesh(antGeometry, material, MAX_ANTS);
+  const mesh = new THREE.InstancedMesh(antGeometry, material, TECHNICAL_HOME_WORKER_LIMIT);
   mesh.frustumCulled = false;
   mesh.castShadow = true;
   mesh.receiveShadow = true;
@@ -1196,7 +1419,7 @@ const rivalMaterials = antMaterials.map((material) => {
   return rivalMaterial;
 });
 const rivalMeshes = rivalMaterials.map((material) => {
-  const mesh = new THREE.InstancedMesh(antGeometry, material, MAX_RIVALS);
+  const mesh = new THREE.InstancedMesh(antGeometry, material, TECHNICAL_RIVAL_WORKER_LIMIT);
   mesh.frustumCulled = false;
   mesh.castShadow = true;
   mesh.receiveShadow = true;
@@ -1210,7 +1433,7 @@ shadowGeometry.rotateX(-Math.PI / 2);
 const antShadows = new THREE.InstancedMesh(
   shadowGeometry,
   new THREE.MeshBasicMaterial({ color: 0x1c160e, transparent: true, opacity: 0.19, depthWrite: false }),
-  MAX_ANTS,
+  TECHNICAL_HOME_WORKER_LIMIT,
 );
 antShadows.frustumCulled = false;
 surfaceGroup.add(antShadows);
@@ -1219,7 +1442,7 @@ const carryGeometry = new THREE.IcosahedronGeometry(0.105, 0);
 const carryMesh = new THREE.InstancedMesh(
   carryGeometry,
   new THREE.MeshStandardMaterial({ color: 0xe3bd66, roughness: 0.9 }),
-  MAX_ANTS,
+  TECHNICAL_HOME_WORKER_LIMIT,
 );
 carryMesh.frustumCulled = false;
 carryMesh.castShadow = true;
@@ -1228,7 +1451,7 @@ surfaceGroup.add(carryMesh);
 const rivalCarryMesh = new THREE.InstancedMesh(
   carryGeometry,
   new THREE.MeshStandardMaterial({ color: 0xb3c985, roughness: 0.9 }),
-  MAX_RIVALS,
+  TECHNICAL_RIVAL_WORKER_LIMIT,
 );
 rivalCarryMesh.frustumCulled = false;
 rivalCarryMesh.castShadow = true;
@@ -1237,11 +1460,52 @@ surfaceGroup.add(rivalCarryMesh);
 const soilCarryMesh = new THREE.InstancedMesh(
   new THREE.DodecahedronGeometry(0.155, 0),
   new THREE.MeshStandardMaterial({ color: 0x9a5a32, roughness: 1, flatShading: true }),
-  MAX_ANTS,
+  TECHNICAL_HOME_WORKER_LIMIT,
 );
 soilCarryMesh.frustumCulled = false;
 soilCarryMesh.castShadow = true;
 surfaceGroup.add(soilCarryMesh);
+
+const adaptiveVisualState = {
+  level: 'full',
+  animationFrames: 4,
+  shadowStride: 1,
+  useTerrainNormals: true,
+  undergroundRepresentativeLimit: UNDERGROUND_WORKER_RENDER_LIMIT,
+  simulatedSurfaceWorkers: 0,
+  renderedSurfaceWorkers: 0,
+  renderedHomeWorkers: 0,
+  renderedRivalWorkers: 0,
+  renderedDescendantWorkers: 0,
+  renderedUndergroundWorkers: 0,
+};
+
+function updateAdaptiveVisualDetail() {
+  let surfaceWorkers = 0;
+  for (const colony of livingColonies()) {
+    surfaceWorkers += colony.workers.reduce((count, worker) => count
+      + Number(worker.alive !== false && !worker.insideNest), 0);
+  }
+  adaptiveVisualState.simulatedSurfaceWorkers = surfaceWorkers;
+  const undergroundView = viewState.undergroundBlend > 0.42;
+  const overview = undergroundView || surfaceWorkers > 420 || cameraRig.distance > 27;
+  const balanced = !overview && (surfaceWorkers > 170 || cameraRig.distance > 18);
+  adaptiveVisualState.level = overview ? 'overview' : balanced ? 'balanced' : 'full';
+  adaptiveVisualState.animationFrames = overview ? 1 : balanced ? 2 : 4;
+  adaptiveVisualState.shadowStride = overview ? 5 : balanced ? 2 : 1;
+  adaptiveVisualState.useTerrainNormals = !overview;
+  adaptiveVisualState.undergroundRepresentativeLimit = overview ? 120 : balanced ? 180 : UNDERGROUND_WORKER_RENDER_LIMIT;
+  const castDetailedShadows = adaptiveVisualState.level === 'full';
+  for (const mesh of [...antMeshes, ...rivalMeshes, ...youngWorkerMeshes]) mesh.castShadow = castDetailedShadows;
+  carryMesh.castShadow = rivalCarryMesh.castShadow = youngCargoMesh.castShadow = adaptiveVisualState.level !== 'overview';
+}
+
+function visualFrameForPhase(phase) {
+  const raw = Math.floor(phase) % 4;
+  if (adaptiveVisualState.animationFrames === 1) return 0;
+  if (adaptiveVisualState.animationFrames === 2) return (raw % 2) * 2;
+  return raw;
+}
 
 const spoilClods = [];
 let excavatedSoil = 0;
@@ -1718,31 +1982,27 @@ const foundingSiteVisualPool = Array.from({ length: 24 }, (_, index) => {
   surfaceGroup.add(group);
   return { group, chamber, rim, queen, brood, nanitics, soil };
 });
-const youngWorkerVisualPool = Array.from({ length: 96 }, (_, index) => {
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: antMaterials[index % antMaterials.length].map,
-    color: 0xb86c55,
-    transparent: true,
-    alphaTest: 0.045,
-    depthWrite: false,
-    depthTest: false,
-    fog: true,
-  }));
-  sprite.visible = false;
-  sprite.renderOrder = 9;
-  surfaceGroup.add(sprite);
-  return sprite;
+const youngWorkerInstanceLookup = [[], [], [], []];
+const youngWorkerMeshes = antMaterials.map((material) => {
+  const mesh = new THREE.InstancedMesh(antGeometry, material.clone(), TECHNICAL_GLOBAL_WORKER_LIMIT);
+  mesh.frustumCulled = false;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.count = 0;
+  mesh.renderOrder = 9;
+  surfaceGroup.add(mesh);
+  return mesh;
 });
-const youngCargoVisualPool = Array.from({ length: 48 }, () => {
-  const cargo = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(0.085, 0),
-    new THREE.MeshStandardMaterial({ color: 0xd9b666, roughness: 0.9 }),
-  );
-  cargo.visible = false;
-  cargo.renderOrder = 9;
-  surfaceGroup.add(cargo);
-  return cargo;
-});
+const youngCargoMesh = new THREE.InstancedMesh(
+  new THREE.IcosahedronGeometry(0.085, 0),
+  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 }),
+  TECHNICAL_GLOBAL_WORKER_LIMIT,
+);
+youngCargoMesh.frustumCulled = false;
+youngCargoMesh.castShadow = true;
+youngCargoMesh.count = 0;
+youngCargoMesh.renderOrder = 9;
+surfaceGroup.add(youngCargoMesh);
 const shedWings = [];
 
 function leaveShedWings(x, z) {
@@ -1769,7 +2029,7 @@ function leaveShedWings(x, z) {
   }
 }
 
-function updateRegionalReproductionVisuals(dt) {
+function renderRegionalReproductionVisuals() {
   const airborne = regionalMating.flyingAlates;
   const visibleFlights = Math.min(airborne.length, flightAlateVisualPool.length);
   for (let i = 0; i < visibleFlights; i++) {
@@ -1850,32 +2110,60 @@ function updateRegionalReproductionVisuals(dt) {
 
   const surfaceYoungWorkers = regionalMating.matedQueens.flatMap((queen) => queen.nanitics || [])
     .filter((worker) => worker.alive && !worker.insideNest);
-  const visibleYoungWorkers = Math.min(surfaceYoungWorkers.length, youngWorkerVisualPool.length);
+  const frameCounts = [0, 0, 0, 0];
+  youngWorkerInstanceLookup.forEach((lookup) => { lookup.length = 0; });
   let visibleYoungCargo = 0;
-  for (let i = 0; i < visibleYoungWorkers; i++) {
-    const worker = surfaceYoungWorkers[i];
-    const sprite = youngWorkerVisualPool[i];
+  const position = new THREE.Vector3();
+  const orientation = new THREE.Quaternion();
+  const groundTilt = new THREE.Quaternion();
+  const headingSpin = new THREE.Quaternion();
+  const normal = new THREE.Vector3();
+  const workerColor = new THREE.Color();
+  const lineageColor = new THREE.Color();
+  const injuryColor = new THREE.Color(0x9b6a58);
+  const cargoColor = new THREE.Color();
+  for (const worker of surfaceYoungWorkers) {
+    const frame = visualFrameForPhase(worker.phase);
+    const instance = frameCounts[frame]++;
+    youngWorkerInstanceLookup[frame][instance] = worker;
     const colony = getColony(worker.colonyId);
-    sprite.position.set(worker.x, groundHeight(worker.x, worker.z) + 0.14 + Math.sin(worker.phase) * 0.012, worker.z);
-    const scale = worker.workerCaste === 'nanitic' ? 0.54 : 0.64;
-    sprite.scale.set(scale, scale, 1);
-    sprite.material.rotation = worker.heading - Math.PI * 0.5;
-    sprite.material.color.setHex(colony?.foundedBy === RIVAL_COLONY_ID ? 0x7897a9 : 0xb9664f);
-    sprite.visible = true;
-    if (worker.carrying && visibleYoungCargo < youngCargoVisualPool.length) {
-      const cargo = youngCargoVisualPool[visibleYoungCargo++];
-      cargo.position.set(
-        worker.x + Math.cos(worker.heading) * 0.18,
-        groundHeight(worker.x, worker.z) + 0.18,
-        worker.z + Math.sin(worker.heading) * 0.18,
+    position.set(worker.x, groundHeight(worker.x, worker.z) + 0.11 + Math.sin(worker.phase) * 0.009, worker.z);
+    if (adaptiveVisualState.useTerrainNormals) groundTilt.setFromUnitVectors(Y_AXIS, groundNormal(worker.x, worker.z, normal));
+    else groundTilt.identity();
+    headingSpin.setFromAxisAngle(Y_AXIS, -worker.heading - Math.PI / 2);
+    orientation.copy(groundTilt).multiply(headingSpin);
+    const scale = worker.workerCaste === 'nanitic' ? 0.62 : 0.72;
+    matrix.compose(position, orientation, new THREE.Vector3(scale, scale, scale));
+    youngWorkerMeshes[frame].setMatrixAt(instance, matrix);
+    lineageColor.setHex(colony?.foundedBy === RIVAL_COLONY_ID ? 0x7897a9 : 0xb9664f);
+    workerColor.copy(lineageColor).lerp(injuryColor, clamp((62 - worker.health) / 48, 0, 0.72));
+    youngWorkerMeshes[frame].setColorAt(instance, workerColor);
+    if (worker.carrying) {
+      const cargoX = worker.x + Math.cos(worker.heading) * 0.18;
+      const cargoZ = worker.z + Math.sin(worker.heading) * 0.18;
+      matrix.compose(
+        new THREE.Vector3(cargoX, groundHeight(cargoX, cargoZ) + 0.18, cargoZ),
+        orientation,
+        new THREE.Vector3(1, 0.68, 1),
       );
-      cargo.material.color.setHex(worker.carryingKind === 'berry' ? 0xa86453 : worker.carryingKind === 'beetle' ? 0x826346 : 0xd9b666);
-      cargo.visible = true;
+      youngCargoMesh.setMatrixAt(visibleYoungCargo, matrix);
+      cargoColor.setHex(worker.carryingKind === 'berry' ? 0xa86453 : worker.carryingKind === 'beetle' ? 0x826346 : 0xd9b666);
+      youngCargoMesh.setColorAt(visibleYoungCargo++, cargoColor);
     }
   }
-  for (let i = visibleYoungWorkers; i < youngWorkerVisualPool.length; i++) youngWorkerVisualPool[i].visible = false;
-  for (let i = visibleYoungCargo; i < youngCargoVisualPool.length; i++) youngCargoVisualPool[i].visible = false;
+  youngWorkerMeshes.forEach((mesh, frame) => {
+    mesh.count = frameCounts[frame];
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  });
+  youngCargoMesh.count = visibleYoungCargo;
+  youngCargoMesh.instanceMatrix.needsUpdate = true;
+  if (youngCargoMesh.instanceColor) youngCargoMesh.instanceColor.needsUpdate = true;
+  adaptiveVisualState.renderedDescendantWorkers = surfaceYoungWorkers.length;
 
+}
+
+function updateShedWingLifecycle(dt) {
   for (let i = shedWings.length - 1; i >= 0; i--) {
     const wing = shedWings[i];
     wing.userData.life -= dt;
@@ -2143,6 +2431,7 @@ function createColonyArchitecture(colony, options = {}) {
     nextEdgeId: 1,
     baseChambers: options.baseChambers || 0,
     baseCapacity: options.baseCapacity || 0,
+    baseBroodCapacity: options.baseBroodCapacity || 0,
     baseStorageCapacity: options.baseStorageCapacity || 0,
     completedProjects: 0,
     totalExcavated: 0,
@@ -2155,6 +2444,10 @@ function createColonyArchitecture(colony, options = {}) {
     storageCapacity: options.baseStorageCapacity || 0,
     legacyVisuals: options.legacyVisuals || false,
     founding: options.founding || false,
+    circulatingWorkers: [],
+    circulationSeconds: 0,
+    inspectionTrips: 0,
+    visitedChamberIds: new Set(),
     queenSprite: null,
     workerPool: null,
     broodPool: null,
@@ -2218,15 +2511,140 @@ function architecturePressure(architecture, colony) {
   const load = workers.length + brood.length * 0.58;
   architecture.occupancy = load / Math.max(1, architecture.habitableCapacity);
   const storagePressure = colony.storedFood / Math.max(1, architecture.storageCapacity);
+  const larvae = brood.filter((item) => item.stage === 'larva').length;
+  const reserveTarget = 8 + workers.length * 0.14 + brood.length * 0.24 + larvae * 1.55;
+  const reserveRatio = colony.storedFood / Math.max(1, reserveTarget);
+  const usefulStoragePressure = storagePressure * clamp((6.2 - reserveRatio) / 3.2, 0, 1);
+  architecture.storagePressure = storagePressure;
+  architecture.usefulStoragePressure = usefulStoragePressure;
+  architecture.reserveRatio = reserveRatio;
   const broodPressure = brood.length / Math.max(1, workers.length * 0.18);
-  architecture.growthDrive = Math.max(architecture.occupancy, storagePressure * 0.76, broodPressure * 0.68);
-  return { workers, brood, storagePressure, broodPressure };
+  architecture.growthDrive = Math.max(architecture.occupancy, usefulStoragePressure * 0.76, broodPressure * 0.68);
+  return { workers, brood, storagePressure, usefulStoragePressure, reserveRatio, broodPressure };
+}
+
+function architectureBroodCapacity(architecture) {
+  if (!architecture) return 12;
+  const excavatedNurserySpace = architecture.nodes
+    .filter((node) => node.completed && (node.type === 'nursery' || node.type === 'founding'))
+    .reduce((sum, node) => sum + Math.max(4, Math.round(node.capacity * 0.72)), 0);
+  return Math.max(8, architecture.baseBroodCapacity + excavatedNurserySpace);
+}
+
+function architectureWorkerCapacity(architecture) {
+  if (!architecture) return 24;
+  return Math.max(8, architecture.baseCapacity
+    + architecture.nodes.filter((node) => node.completed).reduce((sum, node) => sum + node.capacity, 0));
+}
+
+function colonyFoodStorageCapacity(colonyId) {
+  const colony = getColony(colonyId);
+  return Math.max(6, Math.round(colony?.architecture?.storageCapacity || colony?.architecture?.baseStorageCapacity || 6));
+}
+
+function acceptColonyStoredFood(colonyId, current, incoming = 0) {
+  const capacity = colonyFoodStorageCapacity(colonyId);
+  const next = Math.min(capacity, current + incoming);
+  const overflow = Math.max(0, current + incoming - capacity);
+  if (overflow > 0) ecologicalBalance.storageOverflow.set(
+    colonyId,
+    Number(((ecologicalBalance.storageOverflow.get(colonyId) || 0) + overflow).toFixed(2)),
+  );
+  return next;
+}
+
+function consumeColonyStoredFood(colonyId, current, dt, workerCount, options = {}) {
+  const workerRate = options.workerRate ?? 0.0011;
+  const baseRate = options.baseRate ?? 0.012;
+  const seasonalRate = environment.season.name === 'winter' ? 1.28
+    : environment.season.name === 'summer' ? 1.08 : 1;
+  const requestedMetabolism = dt * (baseRate + workerCount * workerRate) * seasonalRate;
+  const metabolized = Math.min(current, requestedMetabolism);
+  current -= metabolized;
+
+  // Damp underground granaries are useful but not lossless: seeds germinate,
+  // mildew, and are discarded. Completed granaries reduce, but cannot erase,
+  // that turnover.
+  const colony = getColony(colonyId);
+  const completedGranaries = colony?.architecture?.nodes
+    .filter((node) => node.completed && node.type === 'granary').length || 0;
+  const granaryProtection = clamp(1 - completedGranaries * 0.035, 0.5, 1);
+  const humidity = clamp((weather.postRainHumidity || 0) + weather.rain * 0.75, 0, 1.4);
+  const spoilageRate = (0.00032 + humidity * 0.00042) * granaryProtection;
+  const spoiled = Math.min(current, current * spoilageRate * dt);
+  current -= spoiled;
+
+  ecologicalBalance.storedFoodMetabolized.set(
+    colonyId,
+    (ecologicalBalance.storedFoodMetabolized.get(colonyId) || 0) + metabolized,
+  );
+  ecologicalBalance.storedFoodSpoiled.set(
+    colonyId,
+    (ecologicalBalance.storedFoodSpoiled.get(colonyId) || 0) + spoiled,
+  );
+  return Math.max(0, current);
+}
+
+function demographicStateFor(colony, careRatio = 1) {
+  if (!colony) return null;
+  const workers = colony.workers.filter((worker) => worker.alive !== false);
+  const broodItems = colony.brood || [];
+  const architecture = colony.architecture;
+  const workerCapacity = architectureWorkerCapacity(architecture);
+  const broodCapacity = architectureBroodCapacity(architecture);
+  const larvae = broodItems.filter((item) => item.stage === 'larva').length;
+  const workerLoad = workers.length + broodItems.length * 0.58;
+  const occupancy = workerLoad / Math.max(1, workerCapacity);
+  const broodOccupancy = broodItems.length / Math.max(1, broodCapacity);
+  const reserveTarget = 8 + workers.length * 0.14 + broodItems.length * 0.24 + larvae * 1.55;
+  const reserveRatio = colony.storedFood / Math.max(1, reserveTarget);
+  const foodFactor = clamp((reserveRatio - 0.2) / 0.92, 0, 1);
+  const broodSpaceFactor = clamp((1.08 - broodOccupancy) / 0.34, 0, 1);
+  const workerSpaceFactor = clamp((1.16 - occupancy) / 0.34, 0, 1);
+  const seasonFactor = environment.season.name === 'winter' ? 0
+    : environment.season.name === 'autumn' ? 0.72 : 1;
+  const safetyFactor = colony.id === HOME_COLONY_ID && environment.pressure === 'disease outbreak' ? 0.38 : 1;
+  const careFactor = clamp(0.34 + careRatio * 0.66, 0.34, 1);
+  const layingDrive = clamp(foodFactor * broodSpaceFactor * workerSpaceFactor
+    * seasonFactor * safetyFactor * careFactor, 0, 1);
+  const starvationPressure = clamp((0.28 - reserveRatio) / 0.28, 0, 1);
+  const crowdingPressure = clamp((occupancy - 1) / 0.34, 0, 1);
+  const factors = [
+    ['food', foodFactor],
+    ['brood space', broodSpaceFactor],
+    ['worker space', workerSpaceFactor],
+    ['nursing', careFactor],
+    ['season', seasonFactor],
+  ];
+  const weakestFactor = factors.sort((a, b) => a[1] - b[1])[0];
+  const limitingFactor = weakestFactor[1] > 0.96 ? 'none' : weakestFactor[0];
+  return {
+    workers: workers.length,
+    brood: broodItems.length,
+    workerCapacity,
+    broodCapacity,
+    occupancy,
+    broodOccupancy,
+    reserveTarget,
+    reserveRatio,
+    foodFactor,
+    broodSpaceFactor,
+    workerSpaceFactor,
+    layingDrive,
+    starvationPressure,
+    crowdingPressure,
+    limitingFactor,
+    queenState: environment.season.name === 'winter' ? 'winter pause'
+      : layingDrive >= 0.62 ? 'laying strongly'
+        : layingDrive >= 0.18 ? `laying slowly · ${limitingFactor} limited`
+          : `laying paused · ${limitingFactor} limited`,
+  };
 }
 
 function chooseArchitectureChamberType(architecture, pressure) {
   if (architecture.growthIndex % 5 === 4) return 'shaft';
   if (pressure.broodPressure > 0.76) return 'nursery';
-  if (pressure.storagePressure > 0.78) return 'granary';
+  if (pressure.usefulStoragePressure > 0.78) return 'granary';
   return architecture.growthIndex % 3 === 2 ? 'ventilation' : 'resting';
 }
 
@@ -2284,6 +2702,90 @@ function depositArchitectureSpoil(architecture, colony) {
   architecture.spoilDeposits++;
 }
 
+function advanceArchitectureCirculation(architecture, colony, dt, assignedDiggers = []) {
+  const completedEdges = architecture.edges.filter((edge) => edge.completed);
+  if (completedEdges.length === 0) {
+    architecture.circulatingWorkers = [];
+    return;
+  }
+  const diggers = new Set(assignedDiggers);
+  const insideWorkers = colony.workers.filter((worker) => worker.alive !== false && worker.insideNest && !diggers.has(worker));
+  const desired = Math.min(60, Math.max(3, Math.ceil(insideWorkers.length * 0.34)));
+  const active = insideWorkers.filter((worker) => worker.architectureCirculation?.dutyUntil > simTime);
+  const recruits = insideWorkers
+    .filter((worker) => !active.includes(worker))
+    .sort((a, b) => ((a.id * 37 + Math.floor(simTime / 18)) % 101) - ((b.id * 37 + Math.floor(simTime / 18)) % 101));
+  while (active.length < desired && recruits.length > 0) {
+    const worker = recruits.shift();
+    worker.architectureCirculation ||= {
+      currentNodeId: architecture.rootNodeId,
+      previousNodeId: null,
+      edgeId: null,
+      direction: 1,
+      t: 0,
+      pause: rand(0.2, 1.5),
+      position: architectureNodeById(architecture, architecture.rootNodeId).position.clone(),
+      heading: 0,
+      visits: 0,
+      visitedNodeIds: new Set([architecture.rootNodeId]),
+      dutyUntil: 0,
+    };
+    worker.architectureCirculation.dutyUntil = simTime + rand(24, 52);
+    active.push(worker);
+  }
+
+  architecture.circulatingWorkers = active;
+  architecture.circulationSeconds += active.length * dt;
+  for (const worker of active) {
+    const route = worker.architectureCirculation;
+    route.pause -= dt;
+    if (!route.edgeId && route.pause <= 0) {
+      const adjacent = completedEdges.filter((edge) => edge.fromNodeId === route.currentNodeId || edge.toNodeId === route.currentNodeId);
+      const forwardChoices = adjacent.filter((edge) => {
+        const destination = edge.fromNodeId === route.currentNodeId ? edge.toNodeId : edge.fromNodeId;
+        return destination !== route.previousNodeId;
+      });
+      const choices = forwardChoices.length > 0 ? forwardChoices : adjacent;
+      choices.sort((a, b) => {
+        const aDestination = a.fromNodeId === route.currentNodeId ? a.toNodeId : a.fromNodeId;
+        const bDestination = b.fromNodeId === route.currentNodeId ? b.toNodeId : b.fromNodeId;
+        return Number(route.visitedNodeIds.has(aDestination)) - Number(route.visitedNodeIds.has(bDestination))
+          || ((worker.id + aDestination * 13) % 17) - ((worker.id + bDestination * 13) % 17);
+      });
+      const edge = choices[0];
+      if (edge) {
+        route.edgeId = edge.id;
+        route.direction = edge.fromNodeId === route.currentNodeId ? 1 : -1;
+        route.t = route.direction > 0 ? 0 : 1;
+      } else route.pause = rand(0.8, 2.2);
+    }
+    const edge = route.edgeId ? completedEdges.find((candidate) => candidate.id === route.edgeId) : null;
+    if (!edge) {
+      const node = architectureNodeById(architecture, route.currentNodeId) || architectureNodeById(architecture, architecture.rootNodeId);
+      route.position.copy(node.position);
+      continue;
+    }
+    const length = Math.max(0.5, edge.curve.getLength());
+    route.t = clamp(route.t + route.direction * dt * (worker.speed || 0.8) * 0.42 / length, 0, 1);
+    edge.curve.getPointAt(route.t, route.position);
+    const tangent = edge.curve.getTangentAt(route.t);
+    route.heading = Math.atan2(tangent.z, tangent.x) + (route.direction < 0 ? Math.PI : 0);
+    const arrived = route.direction > 0 ? route.t >= 0.999 : route.t <= 0.001;
+    if (arrived) {
+      const origin = route.currentNodeId;
+      route.currentNodeId = route.direction > 0 ? edge.toNodeId : edge.fromNodeId;
+      route.previousNodeId = origin;
+      route.edgeId = null;
+      route.pause = rand(0.35, 2.4);
+      route.visits++;
+      route.visitedNodeIds.add(route.currentNodeId);
+      architecture.visitedChamberIds.add(route.currentNodeId);
+      architecture.inspectionTrips++;
+      worker.nestExplorationTrips = (worker.nestExplorationTrips || 0) + 1;
+    }
+  }
+}
+
 function updateArchitectureVisual(architecture, colony) {
   architecture.group.visible = cameraRig.focusedColonyId === architecture.colonyId;
   let activeEdge = null;
@@ -2317,11 +2819,22 @@ function updateArchitectureVisual(architecture, colony) {
     sprite.material.rotation = angle;
     sprite.visible = true;
   }
+  const circulating = architecture.circulatingWorkers.filter((worker) => !assigned.includes(worker));
+  for (let i = 0; i < circulating.length && visibleWorkers < architecture.workerPool.length; i++) {
+    const worker = circulating[i];
+    const route = worker.architectureCirculation;
+    const sprite = architecture.workerPool[visibleWorkers++];
+    sprite.position.copy(route.position);
+    sprite.position.y += Math.sin(simTime * 4.2 + worker.id) * 0.035;
+    sprite.scale.setScalar((worker.size || 0.72) * 0.37);
+    sprite.material.rotation = -route.heading;
+    sprite.visible = true;
+  }
   if (!architecture.legacyVisuals) {
     const chamberNodes = architecture.nodes.filter((node) => node.completed && node.renderChamber);
     for (let i = 0; i < workers.length && visibleWorkers < architecture.workerPool.length && chamberNodes.length > 0; i++) {
       const worker = workers[i];
-      if (assigned.includes(worker)) continue;
+      if (assigned.includes(worker) || circulating.includes(worker)) continue;
       const sprite = architecture.workerPool[visibleWorkers++];
       const node = chamberNodes[i % chamberNodes.length];
       const angle = i * 2.399 + simTime * (0.03 + (i % 4) * 0.008);
@@ -2392,6 +2905,7 @@ function updateColonyArchitectures(dt) {
         createSignal(colony.nest.x, colony.nest.y, architecture.color);
       }
     }
+    advanceArchitectureCirculation(architecture, colony, dt, activeEdge?.activeDiggers || []);
     colony.undergroundFocusY = Math.max(-9.2, chamberDepth(architecture) * 0.72);
     colony.undergroundDistance = architecture.founding
       ? clamp(4.45 + architecture.nodes.length * 0.34, 5.35, 9.4)
@@ -2426,7 +2940,7 @@ const digMotes = new THREE.Points(digMoteGeometry, new THREE.PointsMaterial({
 digMotes.visible = false;
 homeNestScanGroup.add(digMotes);
 
-const undergroundSpritePool = Array.from({ length: MAX_ANTS }, (_, i) => {
+const undergroundSpritePool = Array.from({ length: UNDERGROUND_WORKER_RENDER_LIMIT }, (_, i) => {
   const material = new THREE.SpriteMaterial({
     map: antMaterials[i % antMaterials.length].map,
     color: 0x5c241d,
@@ -2557,6 +3071,15 @@ function updateEntranceVisuals() {
   vestibuleSignal.rotation.z = simTime * (0.12 + activity * 0.22);
 }
 
+function representativeWorkerSample(workers, limit, priority = null) {
+  if (workers.length <= limit) return workers;
+  const sampled = [];
+  const stride = workers.length / limit;
+  for (let i = 0; i < limit; i++) sampled.push(workers[Math.floor((i + 0.5) * stride)]);
+  if (priority && workers.includes(priority) && !sampled.includes(priority)) sampled[sampled.length - 1] = priority;
+  return sampled;
+}
+
 function updateUnderground() {
   homeNestScanGroup.visible = cameraRig.focusedColonyId === HOME_COLONY_ID;
   rivalNestScanGroup.visible = cameraRig.focusedColonyId === RIVAL_COLONY_ID;
@@ -2612,8 +3135,13 @@ function updateUnderground() {
   let visibleNestAnts = 0;
   let visibleSoilLoads = 0;
   let visibleFoodLoads = 0;
-  for (const ant of ants) {
-    if (!ant.insideNest || !ant.nestPosition || visibleNestAnts >= undergroundSpritePool.length) continue;
+  const interiorWorkers = ants.filter((ant) => ant.insideNest && ant.nestPosition);
+  const representativeWorkers = representativeWorkerSample(
+    interiorWorkers,
+    Math.min(undergroundSpritePool.length, adaptiveVisualState.undergroundRepresentativeLimit),
+    selectedAnt?.colonyId === HOME_COLONY_ID ? selectedAnt : null,
+  );
+  for (const ant of representativeWorkers) {
     const sprite = undergroundSpritePool[visibleNestAnts++];
     sprite.position.copy(ant.nestPosition);
     sprite.position.y += Math.sin(ant.phase * 0.5) * 0.025;
@@ -2642,6 +3170,7 @@ function updateUnderground() {
   for (let i = visibleNestAnts; i < undergroundSpritePool.length; i++) undergroundSpritePool[i].visible = false;
   for (let i = visibleSoilLoads; i < undergroundSoilPool.length; i++) undergroundSoilPool[i].visible = false;
   for (let i = visibleFoodLoads; i < undergroundFoodPool.length; i++) undergroundFoodPool[i].visible = false;
+  adaptiveVisualState.renderedUndergroundWorkers = visibleNestAnts;
   updateBiologicalVisuals();
   updateEntranceVisuals();
   updateRivalUndergroundVisuals();
@@ -2655,7 +3184,13 @@ let queenLayClock = 5;
 let queenEggsLaid = 0;
 let workersEclosed = 0;
 const BROOD_STAGE_SECONDS = { egg: 34, larva: 52, pupa: 44 };
-const colonyBiology = { activeNurses: 0, requiredNurses: 0, starvedLarvae: 0 };
+const colonyBiology = {
+  activeNurses: 0,
+  requiredNurses: 0,
+  starvedLarvae: 0,
+  broodDeaths: 0,
+  technicalBlockedEclosions: 0,
+};
 const entranceBiology = {
   cache: [],
   capacity: 72,
@@ -2670,7 +3205,7 @@ const entranceBiology = {
   withheldDepartures: 0,
   storageTransfers: 0,
 };
-for (let i = 0; i < 5; i++) entranceBiology.cache.push({ kind: 'seed', nutrition: 1, value: 2.5 });
+for (let i = 0; i < 5; i++) entranceBiology.cache.push({ kind: 'seed', nutrition: 1, value: 1.35 });
 const GENE_KEYS = ['speed', 'size', 'diseaseResistance', 'aggression', 'foraging'];
 const homeQueenGenome = { speed: 1.02, size: 0.98, diseaseResistance: 1.1, aggression: 0.9, foraging: 1.0 };
 const rivalQueenGenome = { speed: 0.96, size: 1.05, diseaseResistance: 0.9, aggression: 1.18, foraging: 1.12 };
@@ -2775,7 +3310,7 @@ function broodStageDuration(item) {
 
 function updateAlateCohort(reproduction, dt) {
   for (const alate of reproduction.alates) {
-    alate.ageDays += dt / 720;
+    alate.ageDays += dt * SIM_DAYS_PER_SECOND;
     alate.state = environment.season.name === 'winter'
       ? 'overwintering in the alate chamber'
       : environment.season.name === 'summer' && weather.rain < 0.22
@@ -2800,7 +3335,7 @@ function workerMaturity(ageDays) {
 }
 
 function addBrood(stage = 'egg', stageAge = 0, genome = null, generation = 1, options = {}) {
-  if (brood.length >= broodPool.length || ants.length + brood.length >= MAX_ANTS + 40) return null;
+  if (brood.length >= TECHNICAL_BROOD_LIMIT) return null;
   const destiny = options.destiny || 'worker';
   const inherited = genome ? {
     sex: destiny === 'male' ? 'male' : 'female',
@@ -2810,6 +3345,7 @@ function addBrood(stage = 'egg', stageAge = 0, genome = null, generation = 1, op
   } : createOffspringInheritance('queen-amber-001', homeQueenGenome, homeReproduction, destiny);
   const item = {
     id: nextBroodId++, stage, stageAge, care: rand(0.82, 1.08), generation,
+    starvation: 0,
     sex: inherited.sex, destiny: inherited.destiny, genome: inherited.genome, parentage: inherited.parentage,
   };
   brood.push(item);
@@ -2883,7 +3419,7 @@ function nuptialFlightSuitability() {
 }
 
 function matureFlightAlates(reproduction, destiny) {
-  return reproduction.alates.filter((alate) => alate.destiny === destiny && alate.ageDays >= 0.015);
+  return reproduction.alates.filter((alate) => alate.destiny === destiny && alate.ageDays >= 7);
 }
 
 function createFlyingAlate(alate, nest, reproduction, external = false) {
@@ -2972,6 +3508,8 @@ function openNuptialFlight(forced = false) {
   };
   regionalMating.lastFlightAt = simTime;
   regionalMating.windowsOpened++;
+  const flightYear = Math.floor(simTime / ECOLOGICAL_YEAR_SECONDS);
+  ecologicalBalance.annualFlightWindows.set(flightYear, (ecologicalBalance.annualFlightWindows.get(flightYear) || 0) + 1);
   regionalMating.swarmCenter.set(
     (NEST.x + RIVAL_NEST.x) * 0.5 + rand(-1.2, 1.2),
     rand(3.1, 4.1),
@@ -2991,8 +3529,10 @@ function chooseFoundingSite(natalColonyId) {
   for (let i = 0; i < 28; i++) {
     const x = rand(-HALF_W + 5.5, HALF_W - 5.5);
     const z = rand(-HALF_D + 5.5, HALF_D - 5.5);
-    const nestClearance = Math.min(Math.hypot(x - NEST.x, z - NEST.y), Math.hypot(x - RIVAL_NEST.x, z - RIVAL_NEST.y));
-    const queenClearance = regionalMating.matedQueens.reduce((min, queen) => Math.min(min, Math.hypot(x - queen.x, z - queen.z)), 20);
+    const nestClearance = livingColonies().reduce((min, colony) => Math.min(min, Math.hypot(x - colony.nest.x, z - colony.nest.y)), 20);
+    const queenClearance = regionalMating.matedQueens.filter((queen) => queen.alive).reduce(
+      (min, queen) => Math.min(min, Math.hypot(x - queen.x, z - queen.z)), 20,
+    );
     const obstacleClearance = obstacles.reduce((min, obstacle) => Math.min(min, Math.hypot(x - obstacle.x, z - obstacle.z) - obstacle.r), 8);
     const natalNest = natalColonyId === RIVAL_COLONY_ID ? RIVAL_NEST : NEST;
     const dispersal = Math.hypot(x - natalNest.x, z - natalNest.y);
@@ -3006,7 +3546,7 @@ function chooseFoundingSite(natalColonyId) {
 function evaluateFoundingSite(x, z) {
   const normal = groundNormal(x, z);
   const slopeQuality = clamp((normal.y - 0.9) / 0.095, 0, 1);
-  const nestClearance = Math.min(Math.hypot(x - NEST.x, z - NEST.y), Math.hypot(x - RIVAL_NEST.x, z - RIVAL_NEST.y));
+  const nestClearance = livingColonies().reduce((min, colony) => Math.min(min, Math.hypot(x - colony.nest.x, z - colony.nest.y)), 20);
   const nestQuality = clamp((nestClearance - 3.2) / 5.8, 0, 1);
   const obstacleClearance = obstacles.reduce((min, obstacle) => Math.min(min, Math.hypot(x - obstacle.x, z - obstacle.z) - obstacle.r), 6);
   const obstacleQuality = clamp((obstacleClearance - 0.5) / 2.8, 0, 1);
@@ -3090,6 +3630,8 @@ function completeGyneDealation(gyne) {
     eggsLaid: 0,
     workersEclosed: 0,
     foundingDeaths: 0,
+    foundingBroodDeaths: 0,
+    technicalBlockedEclosions: 0,
     nextBroodId: 1,
     nextNaniticId: 1,
     layClock: rand(2.2, 3.4),
@@ -3121,7 +3663,7 @@ function failFoundation(queen, cause) {
 
 function addFoundingEgg(queen, resource = 'reserves') {
   const available = resource === 'colonyFood' ? queen.colonyFood : queen.reserves;
-  if (queen.foundingBrood.length >= 12 || available < (resource === 'colonyFood' ? 2.4 : 18)) return null;
+  if (queen.foundingBrood.length >= TECHNICAL_BROOD_LIMIT || available < (resource === 'colonyFood' ? 2.4 : 18)) return null;
   const inherited = createOffspringInheritance(queen.id, queen.genome, queen.reproduction, 'worker');
   const item = {
     id: `${queen.id}-brood-${queen.nextBroodId++}`,
@@ -3133,6 +3675,7 @@ function addFoundingEgg(queen, resource = 'reserves') {
     parentage: inherited.parentage,
     generation: queen.generation + 1,
     care: clamp(0.86 + queen.genome.size * 0.08 + rand(-0.04, 0.04), 0.86, 1.06),
+    starvation: 0,
   };
   queen.foundingBrood.push(item);
   queen.eggsLaid++;
@@ -3145,6 +3688,7 @@ function addFoundingEgg(queen, resource = 'reserves') {
 
 function createNanitic(queen, broodItem) {
   const colonyId = queen.registeredColonyId || `incipient-${queen.id}`;
+  if (!hasTechnicalWorkerRoom(colonyId, queen.nanitics.length)) return null;
   const firstCohort = queen.workersEclosed < 7;
   const worker = {
     id: queen.nextNaniticId++,
@@ -3159,6 +3703,7 @@ function createNanitic(queen, broodItem) {
     heading: rand(0, Math.PI * 2),
     desired: rand(0, Math.PI * 2),
     phase: rand(0, 10),
+    laneBias: rand(-0.18, 0.18),
     speed: rand(0.66, 0.86) * broodItem.genome.speed,
     genome: broodItem.genome,
     parentage: broodItem.parentage,
@@ -3224,7 +3769,8 @@ function registerFoundingColony(queen) {
     undergroundDistance: 6.8,
     undergroundView: false,
     color: queen.natalColonyId === RIVAL_COLONY_ID ? 0x7191a8 : 0xa5533f,
-    maxWorkers: 60,
+    get maxWorkers() { return architectureWorkerCapacity(this.architecture); },
+    technicalWorkerLimit: TECHNICAL_DESCENDANT_WORKER_LIMIT,
     workers: queen.nanitics,
     brood: queen.foundingBrood,
     reproduction: queen.reproduction,
@@ -3257,18 +3803,37 @@ function updateFoundingBrood(queen, dt) {
     if (item.stage === 'larva') {
       const usesExternalFood = queen.foundingStage === 'young' || queen.foundingStage === 'established';
       const available = usesExternalFood ? queen.colonyFood : queen.reserves;
-      const ration = Math.min(available, dt * 0.032);
+      const requiredRation = dt * 0.032;
+      const ration = Math.min(available, requiredRation);
       if (usesExternalFood) queen.colonyFood -= ration;
       else queen.reserves -= ration;
-      if (ration < dt * 0.022) development *= 0.38;
+      const rationRatio = ration / Math.max(0.0001, requiredRation);
+      if (rationRatio < 0.7) development *= 0.38;
+      item.starvation = clamp((item.starvation || 0)
+        + dt * Math.max(0, 0.72 - rationRatio) * 0.038
+        - dt * Math.max(0, rationRatio - 0.72) * 0.018, 0, 1.2);
+      if (item.starvation >= 1) {
+        queen.foundingBrood.splice(i, 1);
+        queen.foundingBroodDeaths = (queen.foundingBroodDeaths || 0) + 1;
+        recordLineageEvent('brood-died', queen, { cause: 'larval starvation', stage: item.stage });
+        continue;
+      }
     }
     item.stageAge += dt * development;
     if (item.stageAge < FOUNDING_BROOD_SECONDS[item.stage]) continue;
     if (item.stage === 'egg') { item.stage = 'larva'; item.stageAge = 0; }
     else if (item.stage === 'larva') { item.stage = 'pupa'; item.stageAge = 0; }
     else {
+      const worker = createNanitic(queen, item);
+      if (!worker) {
+        if (!item.technicalBlockReported) {
+          item.technicalBlockReported = true;
+          queen.technicalBlockedEclosions = (queen.technicalBlockedEclosions || 0) + 1;
+        }
+        item.stageAge = FOUNDING_BROOD_SECONDS.pupa;
+        continue;
+      }
       queen.foundingBrood.splice(i, 1);
-      createNanitic(queen, item);
       if (!queen.registeredColonyId) registerFoundingColony(queen);
     }
   }
@@ -3280,13 +3845,8 @@ function chooseYoungColonyFood(worker) {
   const sector = network ? chooseForagingSector(worker, network) : null;
   let best = null;
   let bestScore = -Infinity;
-  for (const food of foods) {
-    if (food.amount <= 0) continue;
-    if (network && sector) {
-      const foodSector = sectorForPoint(network, food.x, food.z);
-      const sectorDelta = Math.min(Math.abs(foodSector - sector.id), FORAGING_SECTOR_COUNT - Math.abs(foodSector - sector.id));
-      if (sectorDelta > (navigation.confidence > 0.35 ? 0 : 1)) continue;
-    }
+  const candidates = network && sector ? liveFoodsInSector(network, sector) : foods.filter((food) => food.amount > 0);
+  for (const food of candidates) {
     const distance = Math.hypot(food.x - worker.x, food.z - worker.z);
     const memoryDistance = navigation.rememberedX == null ? 0
       : Math.hypot(food.x - navigation.rememberedX, food.z - navigation.rememberedZ);
@@ -3306,14 +3866,17 @@ function chooseYoungColonyFood(worker) {
 
 function updateYoungWorker(queen, worker, dt) {
   worker.phase += dt * 7.8;
-  worker.ageDays += dt / 720;
+  worker.ageDays += dt * SIM_DAYS_PER_SECOND;
   if (worker.insideNest) {
     worker.nestTimer -= dt;
     worker.energy = Math.min(100, worker.energy + dt * (queen.colonyFood > 0 ? 0.72 : 0.18));
     worker.state = queen.foundingBrood.length > 0 ? 'tending young-colony brood' : 'waiting in the opened founding chamber';
     const activeOutside = queen.nanitics.filter((other) => other.alive && !other.insideNest).length;
     const seasonalForaging = environment.season.name === 'winter' ? 0.38 : environment.season.name === 'autumn' ? 0.78 : 1;
-    const targetOutside = clamp(Math.floor(queen.nanitics.length * 0.68 * seasonalForaging), 1, Math.max(1, queen.nanitics.length - 1));
+    const youngReserveTarget = 8 + queen.nanitics.length * 0.22 + queen.foundingBrood.length * 0.42;
+    const youngFoodPressure = clamp((youngReserveTarget - queen.colonyFood) / Math.max(1, youngReserveTarget), 0, 1);
+    const targetOutside = clamp(Math.floor(queen.nanitics.length * (0.3 + youngFoodPressure * 0.32) * seasonalForaging),
+      1, Math.max(1, queen.nanitics.length - 1));
     if (worker.nestTimer <= 0 && activeOutside < targetOutside && weather.rain < 0.62) {
       const angle = rand(0, Math.PI * 2);
       worker.insideNest = false;
@@ -3341,6 +3904,7 @@ function updateYoungWorker(queen, worker, dt) {
     const outward = Math.atan2(worker.z - queen.z, worker.x - queen.x);
     worker.desired = outward + Math.PI * 0.5 + Math.sin(worker.phase * 0.16) * 0.3;
     if (nestDistance > 1.45) worker.desired = Math.atan2(nestDz, nestDx) + Math.PI * 0.42;
+    applyNeighborAvoidance(worker);
     worker.heading += clamp(wrapAngle(worker.desired - worker.heading), -dt * 3.2, dt * 3.2);
     const velocity = worker.speed * 0.62;
     worker.x += Math.cos(worker.heading) * velocity * dt;
@@ -3365,7 +3929,11 @@ function updateYoungWorker(queen, worker, dt) {
     if (nestDistance < 0.5) {
       if (worker.carrying) {
         recordForagingDelivery(worker);
-        queen.colonyFood += 2.15 * worker.carryingNutrition;
+        queen.colonyFood = acceptColonyStoredFood(
+          worker.colonyId,
+          queen.colonyFood,
+          1.25 * worker.carryingNutrition,
+        );
         queen.foodDelivered++;
         storeSeedCargo(worker.colonyId, {
           kind: worker.carryingKind,
@@ -3390,6 +3958,8 @@ function updateYoungWorker(queen, worker, dt) {
       return;
     }
   } else {
+    const network = colonyForagingNetworks.get(worker.colonyId);
+    if (network) expireStaleForagingMemory(worker, network);
     if (!worker.targetFood || worker.targetFood.amount <= 0 || worker.turnClock <= 0) {
       if (worker.targetFood && worker.targetFood.amount <= 0 && !worker.carrying) recordForagingFailure(worker);
       worker.targetFood = youngColonyStressTest ? null : chooseYoungColonyFood(worker);
@@ -3404,6 +3974,10 @@ function updateYoungWorker(queen, worker, dt) {
       const network = colonyForagingNetworks.get(worker.colonyId);
       if (network && navigation.guidance === 'private route memory') network.memoryGuidedSteps += dt;
       else if (network && navigation.guidance === 'social sector activation') network.socialGuidedSteps += dt;
+      if (network) {
+        const sector = network.sectors[navigation.sectorId ?? 0];
+        advanceForagingSearch(worker, network, sector, dt);
+      }
       if (distance < 0.42 && worker.targetFood.amount > 0) {
         worker.carrying = true;
         worker.carryingKind = worker.targetFood.kind;
@@ -3414,22 +3988,19 @@ function updateYoungWorker(queen, worker, dt) {
         removeFoodUnits(worker.targetFood, 1, 'ant harvest');
       }
     } else {
-      navigation.searchTime += dt;
-      if (navigation.searchTime > 16) {
-        recordForagingFailure(worker);
-        navigation.searchTime = 0;
-      }
       const network = colonyForagingNetworks.get(worker.colonyId);
       const sector = network && navigation.sectorId != null ? network.sectors[navigation.sectorId] : null;
       if (network && sector) {
-        const target = sectorTarget(network, sector);
+        const target = foragingSearchTarget(worker, network, sector);
         worker.desired = Math.atan2(target.z - worker.z, target.x - worker.x) + Math.sin(worker.phase * 0.11) * 0.16;
+        advanceForagingSearch(worker, network, sector, dt);
       } else if (worker.turnClock <= 0) worker.desired += rand(-0.9, 0.9);
       if (nestDistance > 7.5) worker.desired = Math.atan2(nestDz, nestDx);
       worker.state = 'searching the local sector for food';
     }
   }
 
+  applyNeighborAvoidance(worker);
   worker.heading += clamp(wrapAngle(worker.desired - worker.heading), -dt * 3.6, dt * 3.6);
   const velocity = worker.speed * (1 - weather.rain * 0.24) * (worker.carrying ? 1.04 : 1);
   worker.x = clamp(worker.x + Math.cos(worker.heading) * velocity * dt, -HALF_W + 0.35, HALF_W - 0.35);
@@ -3437,13 +4008,18 @@ function updateYoungWorker(queen, worker, dt) {
   worker.distanceTraveled += velocity * dt;
 
   if (youngColonyStressTest) worker.health -= dt * 1.35;
-  else if (worker.energy <= 0 && queen.colonyFood <= 0) worker.health -= dt * 0.07;
+  else {
+    const seniority = Math.max(0, worker.ageDays - WORKER_SENESCENCE_DAYS);
+    worker.health -= dt * seniority * WORKER_SENESCENCE_RATE * (worker.insideNest ? 0.72 : 1.18);
+    if (worker.energy <= 0 && queen.colonyFood <= 0) worker.health -= dt * 0.07;
+  }
 }
 
 function markYoungWorkerDead(queen, worker, cause) {
   if (!worker.alive) return;
   worker.alive = false;
   queen.workerDeaths++;
+  queen.foundingDeaths++;
   recordLineageEvent('young-worker-died', queen, { workerId: worker.id, cause, caste: worker.workerCaste });
 }
 
@@ -3464,21 +4040,47 @@ function collapseYoungColony(queen, cause) {
 
 function updateYoungColony(queen, dt) {
   const colony = getColony(queen.registeredColonyId);
-  queen.colonyFood = Math.max(0, queen.colonyFood - dt * (0.004 + queen.nanitics.length * 0.0014));
-  for (const worker of queen.nanitics) updateYoungWorker(queen, worker, dt);
+  queen.colonyFood = acceptColonyStoredFood(queen.registeredColonyId, queen.colonyFood);
+  queen.colonyFood = consumeColonyStoredFood(
+    queen.registeredColonyId,
+    queen.colonyFood,
+    dt,
+    queen.nanitics.length,
+    { baseRate: 0.004, workerRate: 0.0014 },
+  );
+  const activeNurses = queen.nanitics.filter((worker) => worker.alive && worker.insideNest).length;
+  const requiredNurses = Math.max(1, Math.ceil(queen.foundingBrood.length / 3.4));
+  const careRatio = clamp(activeNurses / requiredNurses, 0.35, 1.15);
+  let demographics = demographicStateFor(colony, careRatio);
+  if (colony) colony.demographics = demographics;
+  for (const worker of queen.nanitics) {
+    updateYoungWorker(queen, worker, dt);
+    worker.health -= dt * demographics.starvationPressure * 0.082;
+    worker.health -= dt * demographics.crowdingPressure * 0.014;
+  }
   for (let i = queen.nanitics.length - 1; i >= 0; i--) {
     const worker = queen.nanitics[i];
     if (worker.health > 0) continue;
-    markYoungWorkerDead(queen, worker, youngColonyStressTest ? 'controlled resource collapse' : 'starvation');
+    const cause = youngColonyStressTest ? 'controlled resource collapse'
+      : demographics.starvationPressure > 0.45 ? 'starvation'
+        : demographics.crowdingPressure > 0.6 ? 'crowding stress' : 'age';
+    markYoungWorkerDead(queen, worker, cause);
     queen.nanitics.splice(i, 1);
   }
 
   queen.layClock -= dt;
-  if (queen.layClock <= 0 && environment.season.name !== 'winter'
-    && queen.colonyFood > 7 && queen.foundingBrood.length < 10 && queen.nanitics.length < 24) {
-    addFoundingEgg(queen, 'colonyFood');
-    queen.layClock = rand(5.2, 7.4);
-    queen.state = 'laying a food-supported worker cohort';
+  demographics = demographicStateFor(colony, careRatio);
+  if (colony) colony.demographics = demographics;
+  if (queen.layClock <= 0) {
+    const canLay = demographics.layingDrive > 0.08
+      && queen.foundingBrood.length < demographics.broodCapacity
+      && queen.foundingBrood.length < TECHNICAL_BROOD_LIMIT;
+    if (canLay && addFoundingEgg(queen, 'colonyFood')) {
+      queen.state = 'laying a food-supported worker cohort';
+    }
+    queen.layClock = canLay
+      ? rand(5.2, 7.4) / clamp(0.62 + demographics.layingDrive * 0.58, 0.62, 1.2)
+      : rand(3.2, 5.4);
   }
   updateFoundingBrood(queen, dt);
 
@@ -3496,11 +4098,14 @@ function updateYoungColony(queen, dt) {
     queen.state = 'established young colony with sustained foraging';
     recordLineageEvent('colony-established', queen, { workers: queen.nanitics.length, storedFood: Number(queen.colonyFood.toFixed(1)) });
   } else if (queen.foundingStage === 'young') {
-    queen.state = queen.colonyFood < 3 ? 'young colony under food pressure' : 'young colony sustaining queen and brood';
+    queen.state = demographics.layingDrive < 0.08
+      ? `young colony constrained by ${demographics.limitingFactor}` : 'young colony sustaining queen and brood';
   } else if (queen.foundingStage === 'established') {
     queen.state = environment.season.name === 'winter'
       ? 'established colony in winter conservation'
-      : 'established colony sustaining foraging and brood';
+      : demographics.layingDrive < 0.08
+        ? `established colony constrained by ${demographics.limitingFactor}`
+        : 'established colony sustaining foraging and brood';
   }
 }
 
@@ -3605,7 +4210,7 @@ function updateFoundingQueen(queen, dt) {
       queen.state = queen.registeredColonyId ? 'laying a second nanitic cohort' : 'laying the first claustral egg cohort';
     }
     updateFoundingBrood(queen, dt);
-    for (const worker of queen.nanitics) worker.ageDays += dt / 720;
+    for (const worker of queen.nanitics) worker.ageDays += dt * SIM_DAYS_PER_SECOND;
     if (queen.registeredColonyId && queen.nanitics.length >= 3) {
       queen.state = 'incipient colony · nanitics tending queen and brood';
     }
@@ -3662,7 +4267,9 @@ function updateNuptialFlight(dt) {
   const enoughAlates = availableMatureGynes() > 0
     && (matureFlightAlates(homeReproduction, 'male').length + matureFlightAlates(rivalReproduction, 'male').length > 0);
   if (forceFlightWhenReady && regionalMating.windowsOpened === 0 && availableMatureGynes() > 0) openNuptialFlight(true);
-  else if (!manualFlightOnly && !forceFlightWhenReady && !regionalMating.flightWindow.active && enoughAlates && simTime - regionalMating.lastFlightAt > 60
+  else if (!manualFlightOnly && !forceFlightWhenReady && !regionalMating.flightWindow.active && enoughAlates
+    && (ecologicalBalance.annualFlightWindows.get(Math.floor(simTime / ECOLOGICAL_YEAR_SECONDS)) || 0) < 1
+    && simTime - regionalMating.lastFlightAt > 60
     && regionalMating.lastSuitability > 0.38) openNuptialFlight(false);
 
   if (regionalMating.flightWindow.active) {
@@ -3740,7 +4347,7 @@ function updateNuptialFlight(dt) {
     queen.heading += Math.sin(simTime * 0.22 + queen.x) * dt * 0.08;
   }
   updateFoundingQueens(dt);
-  updateRegionalReproductionVisuals(dt);
+  updateShedWingLifecycle(dt);
 }
 
 function chooseNestPurpose(ant) {
@@ -3819,7 +4426,7 @@ function beginExcavationJourney(ant, projectIndex = chooseExcavationProject()) {
 }
 
 function spawnAnt(initialPopulation = false, options = {}) {
-  if (ants.length >= MAX_ANTS || (colonyRegistry.size > 0 && totalActiveWorkers() >= MAX_ACTIVE_WORKERS)) return null;
+  if (!hasTechnicalWorkerRoom(HOME_COLONY_ID, ants.length)) return null;
   const angle = rand(0, Math.PI * 2);
   const ageDays = options.ageDays ?? rand(7, 47);
   const genome = options.genome || mutateGenome(homeQueenGenome, initialPopulation ? 0.09 : 0.055);
@@ -4138,12 +4745,16 @@ function updateSpider(dt) {
 }
 
 function updateSurvival(dt) {
-  environment.seasonIndex = (Math.floor(simTime / 92) + requestedSeasonOffset) % SEASONS.length;
-  environment.seasonProgress = (simTime % 92) / 92;
+  environment.seasonIndex = (Math.floor(simTime / SEASON_SECONDS) + requestedSeasonOffset) % SEASONS.length;
+  environment.seasonProgress = (simTime % SEASON_SECONDS) / SEASON_SECONDS;
   environment.season = SEASONS[environment.seasonIndex];
   const infected = ants.filter((ant) => ant.infection > 0);
   const prevalence = infected.length / Math.max(1, ants.length);
-  environment.pressure = storedFood < 22 ? 'food crisis'
+  const careRatio = colonyBiology.requiredNurses > 0
+    ? colonyBiology.activeNurses / colonyBiology.requiredNurses : 1;
+  const demographics = demographicStateFor(homeColonyRecord, careRatio);
+  homeColonyRecord.demographics = demographics;
+  environment.pressure = demographics.reserveRatio < 0.34 ? 'food crisis'
     : prevalence > 0.09 ? 'disease outbreak'
       : predator.active || spider.active ? 'predator alarm'
         : environment.season.name === 'winter' ? 'winter conservation' : 'stable';
@@ -4163,9 +4774,10 @@ function updateSurvival(dt) {
 
   for (const ant of ants) {
     if (!ant.alive) continue;
-    const seniority = Math.max(0, ant.ageDays - 44);
-    ant.health -= dt * seniority * 0.0018;
-    if (storedFood < 4) ant.health -= dt * 0.045;
+    const seniority = Math.max(0, ant.ageDays - WORKER_SENESCENCE_DAYS);
+    ant.health -= dt * seniority * WORKER_SENESCENCE_RATE * (ant.insideNest ? 0.72 : 1.18);
+    ant.health -= dt * demographics.starvationPressure * 0.072;
+    ant.health -= dt * demographics.crowdingPressure * 0.012;
     if (ant.infection > 0) {
       ant.infectionTimer -= dt;
       ant.infection = clamp(ant.infection + dt * 0.004 / ant.genome.diseaseResistance, 0, 1);
@@ -4184,7 +4796,11 @@ function updateSurvival(dt) {
     } else if (ant.insideNest && storedFood > 24) {
       ant.health = Math.min(100, ant.health + dt * 0.018);
     }
-    if (ant.health <= 0) markWorkerDead(ant, storedFood < 4 ? 'starvation' : ant.infection > 0 ? 'disease' : 'age');
+    if (ant.health <= 0) {
+      markWorkerDead(ant, demographics.starvationPressure > 0.45 ? 'starvation'
+        : ant.infection > 0 ? 'disease'
+          : demographics.crowdingPressure > 0.6 ? 'crowding stress' : 'age');
+    }
   }
 
   for (let i = remains.length - 1; i >= 0; i--) {
@@ -4203,7 +4819,7 @@ const rivalAnts = [];
 const rivalBrood = [];
 let nextRivalId = 1;
 const rivalColony = {
-  storedFood: 82,
+  storedFood: demographicScenario === 'scarcity' ? 2 : demographicScenario === 'abundance' ? 220 : 82,
   delivered: 0,
   eggsLaid: 0,
   workersEclosed: 0,
@@ -4214,6 +4830,11 @@ const rivalColony = {
   ourCasualties: 0,
   rivalCasualties: 0,
   sanitized: 0,
+  broodDeaths: 0,
+  ageDeaths: 0,
+  starvationDeaths: 0,
+  crowdingDeaths: 0,
+  technicalBlockedEclosions: 0,
 };
 const rivalEntranceBiology = {
   cache: [],
@@ -4226,7 +4847,7 @@ const rivalEntranceBiology = {
   storageTransfers: 0,
   activeTransfers: 0,
 };
-for (let i = 0; i < 4; i++) rivalEntranceBiology.cache.push({ kind: 'seed', nutrition: 1, value: 2.4 });
+for (let i = 0; i < 4; i++) rivalEntranceBiology.cache.push({ kind: 'seed', nutrition: 1, value: 1.35 });
 
 function markRivalDead(rival, cause = 'territorial conflict') {
   if (!rival.alive) return;
@@ -4234,11 +4855,14 @@ function markRivalDead(rival, cause = 'territorial conflict') {
   rival.deathCause = cause;
   rivalColony.deaths++;
   if (cause === 'territorial conflict') rivalColony.rivalCasualties++;
+  else if (cause === 'starvation') rivalColony.starvationDeaths++;
+  else if (cause === 'age') rivalColony.ageDeaths++;
+  else if (cause === 'crowding stress') rivalColony.crowdingDeaths++;
   leaveWorkerRemains(rival);
 }
 
 function spawnRival(newborn = false, options = {}) {
-  if (rivalAnts.length >= MAX_RIVALS || (colonyRegistry.size > 0 && totalActiveWorkers() >= MAX_ACTIVE_WORKERS)) return null;
+  if (!hasTechnicalWorkerRoom(RIVAL_COLONY_ID, rivalAnts.length)) return null;
   const angle = rand(0, Math.PI * 2);
   const radius = newborn ? rand(0.4, 0.75) : Math.sqrt(random()) * rand(1.2, 8.5);
   const roleRoll = random();
@@ -4252,6 +4876,7 @@ function spawnRival(newborn = false, options = {}) {
     heading: angle,
     desired: angle,
     phase: rand(0, 10),
+    laneBias: rand(-0.18, 0.18),
     speed: rand(0.82, 1.16) * genome.speed,
     size: (roleRoll < 0.18 ? rand(1.03, 1.16) : rand(0.82, 1.02)) * genome.size,
     role: roleRoll < 0.18 ? 'guard' : roleRoll < 0.32 ? 'scout' : 'forager',
@@ -4291,7 +4916,7 @@ function spawnRival(newborn = false, options = {}) {
 }
 
 function addRivalBrood(stage = 'egg', stageAge = 0, genome = null, generation = 1, options = {}) {
-  if (rivalBrood.length >= 54) return null;
+  if (rivalBrood.length >= TECHNICAL_BROOD_LIMIT) return null;
   const destiny = options.destiny || 'worker';
   const inherited = genome ? {
     sex: destiny === 'male' ? 'male' : 'female',
@@ -4300,7 +4925,7 @@ function addRivalBrood(stage = 'egg', stageAge = 0, genome = null, generation = 
     parentage: options.parentage || { damId: 'founding-population', sireId: null, sireLineageId: null, ploidy: destiny === 'male' ? 'haploid' : 'diploid' },
   } : createOffspringInheritance('queen-slate-001', rivalQueenGenome, rivalReproduction, destiny);
   const item = {
-    stage, stageAge, vigor: rand(0.88, 1.1), generation,
+    stage, stageAge, vigor: rand(0.88, 1.1), starvation: 0, generation,
     sex: inherited.sex, destiny: inherited.destiny, genome: inherited.genome, parentage: inherited.parentage,
   };
   rivalBrood.push(item);
@@ -4329,7 +4954,8 @@ const homeColonyRecord = registerColony({
   undergroundFocusY: -3.75,
   undergroundDistance: 11.8,
   color: 0xa84f36,
-  maxWorkers: MAX_ANTS,
+  get maxWorkers() { return architectureWorkerCapacity(this.architecture); },
+  technicalWorkerLimit: TECHNICAL_HOME_WORKER_LIMIT,
   workers: ants,
   brood,
   reproduction: homeReproduction,
@@ -4359,7 +4985,8 @@ const rivalColonyRecord = registerColony({
   undergroundFocusY: -4.55,
   undergroundDistance: 10.8,
   color: 0x748fa6,
-  maxWorkers: MAX_RIVALS,
+  get maxWorkers() { return architectureWorkerCapacity(this.architecture); },
+  technicalWorkerLimit: TECHNICAL_RIVAL_WORKER_LIMIT,
   workers: rivalAnts,
   brood: rivalBrood,
   reproduction: rivalReproduction,
@@ -4379,6 +5006,7 @@ createColonyArchitecture(homeColonyRecord, {
   anchor: tunnelSegments[3].curve.getPointAt(1),
   baseChambers: 4,
   baseCapacity: 150,
+  baseBroodCapacity: 60,
   baseStorageCapacity: 118,
   legacyVisuals: true,
 });
@@ -4386,6 +5014,7 @@ createColonyArchitecture(rivalColonyRecord, {
   anchor: rivalNestCurves[0].getPointAt(1),
   baseChambers: 4,
   baseCapacity: 76,
+  baseBroodCapacity: 54,
   baseStorageCapacity: 88,
   legacyVisuals: true,
 });
@@ -4427,6 +5056,7 @@ function cycleFocusedColony() {
 }
 
 function moveRival(rival, dt, speedFactor = 1) {
+  applyNeighborAvoidance(rival);
   const turnRate = dt * 4.2;
   rival.heading += clamp(wrapAngle(rival.desired - rival.heading), -turnRate, turnRate);
   const speed = rival.speed * speedFactor * (1 - weather.rain * 0.22) * webSlowAt(rival.x, rival.z);
@@ -4450,16 +5080,23 @@ function nearestRivalFood(rival, pickupDistance = 0.58) {
 function updateRivalAnt(rival, dt) {
   if (!rival.alive) return;
   rival.phase += dt * rival.speed * 8.1;
-  rival.ageDays += dt / 720;
+  rival.ageDays += dt * SIM_DAYS_PER_SECOND;
   rival.turnClock -= dt;
   rival.fightCooldown -= dt;
 
   if (rival.insideNest) {
     rival.transferTimer -= dt;
     rival.energy = Math.min(100, rival.energy + dt * 0.7);
-    rival.state = 'moving cached food through slate nest';
+    rival.state = rival.role === 'interior' ? 'circulating through slate interior galleries' : 'moving cached food through slate nest';
+    if (rival.role === 'interior') {
+      if (rival.transferTimer <= 0) {
+        rival.transferTimer = rand(4, 9);
+        rival.nestExplorationTrips = (rival.nestExplorationTrips || 0) + 1;
+      }
+      return;
+    }
     if (rival.transferTimer <= 0 && rival.transferCargo) {
-      rivalColony.storedFood = Math.min(150, rivalColony.storedFood + rival.transferCargo.value);
+      rivalColony.storedFood = acceptColonyStoredFood(RIVAL_COLONY_ID, rivalColony.storedFood, rival.transferCargo.value);
       storeSeedCargo(RIVAL_COLONY_ID, rival.transferCargo);
       rivalColony.delivered++;
       rivalEntranceBiology.storageTransfers++;
@@ -4478,6 +5115,15 @@ function updateRivalAnt(rival, dt) {
         rival.z = RIVAL_NEST.y + Math.sin(emergeAngle) * rand(0.36, 0.58);
         rival.state = 'leaving slate entrance after transfer work';
       }
+    }
+    if (rival.transferTimer <= 0 && !rival.transferCargo && rival.role !== 'transfer') {
+      rival.insideNest = false;
+      const emergeAngle = rand(0, Math.PI * 2);
+      rival.x = RIVAL_NEST.x + Math.cos(emergeAngle) * rand(0.5, 0.78);
+      rival.z = RIVAL_NEST.y + Math.sin(emergeAngle) * rand(0.42, 0.66);
+      rival.heading = emergeAngle;
+      rival.desired = emergeAngle;
+      rival.state = 'leaving slate interior for surface duty';
     }
     return;
   }
@@ -4514,6 +5160,10 @@ function updateRivalAnt(rival, dt) {
     rival.desired = shouldFight ? toward : toward + Math.PI;
     rival.state = shouldFight ? 'defending rival territory' : 'retreating from border';
     opponent.state = shouldFight ? 'fighting rival worker' : 'pressing territorial border';
+    if (shouldFight) {
+      rival.combatContactUntil = simTime + 0.45;
+      opponent.combatContactUntil = simTime + 0.45;
+    }
     if (shouldFight && opponentDistance < 0.42 && rival.fightCooldown <= 0 && opponent.borderCooldown <= 0) {
       const rivalPower = (rival.role === 'guard' ? 1.18 : 0.92) * rival.genome.aggression;
       const homePower = (opponent.workerCaste === 'major' ? 1.45 : opponent.workerCaste === 'minor' ? 0.82 : 1) * opponent.genome.aggression;
@@ -4539,6 +5189,19 @@ function updateRivalAnt(rival, dt) {
   const homeDz = RIVAL_NEST.y - rival.z;
   const homeDistance = Math.hypot(homeDx, homeDz);
   const navigation = ensureWorkerNavigation(rival, rival.generation === 0);
+  expireStaleForagingMemory(rival, rivalForagingNetwork);
+  if (rival.role === 'interior') {
+    rival.desired = Math.atan2(homeDz, homeDx) + rival.laneBias * 0.24;
+    rival.state = 'returning to slate interior reserve';
+    if (homeDistance < 0.74) {
+      rival.insideNest = true;
+      rival.transferTimer = rand(4, 9);
+      rival.nestPosition.set(RIVAL_NEST.x, groundHeight(RIVAL_NEST.x, RIVAL_NEST.y) - 0.7, RIVAL_NEST.y);
+      return;
+    }
+    moveRival(rival, dt, 1.04);
+    return;
+  }
   if (!rival.carrying && navigation.learningWalk < 1 && homeDistance < 2.2 && rival.role !== 'guard') {
     const outward = Math.atan2(rival.z - RIVAL_NEST.y, rival.x - RIVAL_NEST.x);
     rival.desired = outward + Math.PI * 0.5 + Math.sin(rival.phase * 0.14) * 0.28;
@@ -4564,7 +5227,7 @@ function updateRivalAnt(rival, dt) {
         rivalEntranceBiology.cache.push({
           kind: rival.carryingKind || 'seed',
           nutrition: rival.carryingNutrition,
-          value: 2.4 * rival.carryingNutrition,
+          value: 1.35 * rival.carryingNutrition,
           seedSpecies: rival.carryingSeedSpecies || null,
           sourcePlantId: rival.carryingSourcePlantId || null,
         });
@@ -4599,7 +5262,9 @@ function updateRivalAnt(rival, dt) {
     }
   }
 
-  const pickup = nearestRivalFood(rival);
+  const scoutCanCollect = rival.role === 'scout'
+    && (rivalColonyRecord.demographics?.reserveRatio || 0) < 1.1;
+  const pickup = rival.role === 'forager' || scoutCanCollect ? nearestRivalFood(rival) : null;
   if (pickup) {
     rival.carrying = true;
     rival.carryingNutrition = pickup.nutrition;
@@ -4618,14 +5283,11 @@ function updateRivalAnt(rival, dt) {
     const sector = chooseForagingSector(rival, rivalForagingNetwork);
     let bestSource = null;
     let bestScore = -Infinity;
-    for (const food of foods) {
-      if (food.amount <= 0) continue;
+    for (const food of liveFoodsInSector(rivalForagingNetwork, sector)) {
       const distance = Math.hypot(food.x - rival.x, food.z - rival.z);
-      const foodSector = sectorForPoint(rivalForagingNetwork, food.x, food.z);
-      const sectorDelta = Math.min(Math.abs(foodSector - sector.id), FORAGING_SECTOR_COUNT - Math.abs(foodSector - sector.id));
       const memoryDistance = navigation.rememberedX == null ? 0 : Math.hypot(food.x - navigation.rememberedX, food.z - navigation.rememberedZ);
       const score = food.nutrition * 2.2 * rival.genome.foraging + Math.log1p(food.amount) - distance * 0.24
-        - sectorDelta * 0.7 - memoryDistance * navigation.confidence * 0.12 + sector.socialPulse * 0.35;
+        - memoryDistance * navigation.confidence * 0.12 + sector.socialPulse * 0.35;
       if (score > bestScore) { bestScore = score; bestSource = food; }
     }
     rival.targetFood = bestSource;
@@ -4643,9 +5305,15 @@ function updateRivalAnt(rival, dt) {
     if (privateWeight > socialWeight) rivalForagingNetwork.memoryGuidedSteps += dt;
     else rivalForagingNetwork.socialGuidedSteps += dt;
     rival.state = rival.role === 'scout' ? 'scouting contested food' : `foraging by ${navigation.guidance}`;
+    advanceForagingSearch(rival, rivalForagingNetwork, sector, dt);
   } else {
-    rival.desired += rand(-0.5, 0.5);
-    rival.state = 'patrolling rival territory';
+    const sector = chooseForagingSector(rival, rivalForagingNetwork);
+    const target = foragingSearchTarget(rival, rivalForagingNetwork, sector);
+    rival.desired = Math.atan2(target.z - rival.z, target.x - rival.x)
+      + Math.sin(rival.phase * 0.1 + rival.id) * 0.24;
+    navigation.guidance = 'sector exploration';
+    rival.state = rival.role === 'scout' ? 'surveying an unconfirmed sector' : 'patrolling a local search fan';
+    advanceForagingSearch(rival, rivalForagingNetwork, sector, dt);
   }
   if (rival.role === 'guard' && homeDistance > 6.2) rival.desired = Math.atan2(homeDz, homeDx);
   if (homeDistance > 14) rival.desired = Math.atan2(homeDz, homeDx);
@@ -4653,13 +5321,24 @@ function updateRivalAnt(rival, dt) {
 }
 
 function updateRivalColony(dt) {
-  rivalColony.storedFood = Math.max(0, rivalColony.storedFood - dt * (0.01 + rivalAnts.length * 0.0002));
+  rivalColony.storedFood = acceptColonyStoredFood(RIVAL_COLONY_ID, rivalColony.storedFood);
+  rivalColony.storedFood = consumeColonyStoredFood(
+    RIVAL_COLONY_ID,
+    rivalColony.storedFood,
+    dt,
+    rivalAnts.length,
+    { baseRate: 0.015, workerRate: 0.001 },
+  );
   updateAlateCohort(rivalReproduction, dt);
   if ((environment.season.name === 'spring' || environment.season.name === 'summer') && rivalColony.storedFood > 62) {
     rivalReproduction.reproductiveBudget = clamp(
       rivalReproduction.reproductiveBudget + dt * 0.018 * clamp((rivalColony.storedFood - 62) / 55, 0, 1), 0, 18,
     );
   }
+  const rivalCareRatio = rivalBrood.length > 0
+    ? clamp(rivalAnts.length / Math.max(1, rivalBrood.length * 3.6), 0.42, 1) : 1;
+  let demographics = demographicStateFor(rivalColonyRecord, rivalCareRatio);
+  rivalColonyRecord.demographics = demographics;
   rivalEntranceBiology.activation = Math.max(0.08, rivalEntranceBiology.activation - dt * (0.023 + weather.rain * 0.014));
   rivalEntranceBiology.recentReturns = Math.max(0, rivalEntranceBiology.recentReturns - dt * 0.045);
   const activeRivalTransfers = rivalAnts.filter((rival) => rival.insideNest && rival.transferCargo).length;
@@ -4687,8 +5366,8 @@ function updateRivalColony(dt) {
   rivalEntranceBiology.activeTransfers = rivalAnts.filter((rival) => rival.insideNest && rival.transferCargo).length;
   rivalColony.roleClock -= dt;
   if (rivalColony.roleClock <= 0) {
-    const guardTarget = clamp(Math.round(rivalAnts.length * 0.16), 7, 18);
-    const scoutTarget = clamp(Math.round(rivalAnts.length * 0.14), 6, 16);
+    const guardTarget = clamp(Math.round(rivalAnts.length * 0.16), 3, 18);
+    const scoutTarget = clamp(Math.round(rivalAnts.length * 0.14), 3, 16);
     const guards = rivalAnts.filter((rival) => rival.role === 'guard');
     const scouts = rivalAnts.filter((rival) => rival.role === 'scout');
     const promotable = rivalAnts
@@ -4702,86 +5381,142 @@ function updateRivalColony(dt) {
       const promoted = promotable.shift();
       promoted.role = promoted.assignedRole = 'scout';
     }
+    const rivalFoodPressure = clamp((1.28 - demographics.reserveRatio) / 1.08, 0, 1);
+    const rivalReserveSurplus = clamp((demographics.reserveRatio - 2.4) / 3.2, 0, 1);
+    const rivalSeasonFactor = environment.season.name === 'winter' ? 0.52 : environment.season.name === 'autumn' ? 0.8 : 1;
+    const desiredForagers = clamp(Math.round(rivalAnts.length
+      * (0.15 - rivalReserveSurplus * 0.075 + rivalFoodPressure * 0.34
+        + rivalEntranceBiology.activation * 0.055) * rivalSeasonFactor), 4, Math.round(rivalAnts.length * 0.52));
+    const currentForagers = rivalAnts.filter((rival) => rival.role === 'forager');
+    if (currentForagers.length > desiredForagers) {
+      currentForagers
+        .sort((a, b) => Math.hypot(a.x - RIVAL_NEST.x, a.z - RIVAL_NEST.y)
+          - Math.hypot(b.x - RIVAL_NEST.x, b.z - RIVAL_NEST.y))
+        .slice(0, currentForagers.length - desiredForagers)
+        .forEach((rival) => { rival.role = rival.assignedRole = 'interior'; });
+    } else if (currentForagers.length < desiredForagers) {
+      rivalAnts.filter((rival) => rival.role === 'interior')
+        .sort((a, b) => b.energy - a.energy)
+        .slice(0, desiredForagers - currentForagers.length)
+        .forEach((rival) => {
+          rival.role = rival.assignedRole = 'forager';
+          rival.transferTimer = Math.min(rival.transferTimer || 0, rand(0.4, 1.4));
+        });
+    }
     rivalColony.roleClock = 5;
   }
   for (let i = rivalBrood.length - 1; i >= 0; i--) {
     const item = rivalBrood[i];
-    let development = item.vigor * (rivalColony.storedFood > 8 ? 0.9 : 0.3);
+    let development = item.vigor * (demographics.foodFactor > 0.18 ? 0.9 : 0.3);
     if (item.stage === 'larva') {
       const rationMultiplier = item.destiny === 'gyne' ? 1.9 : item.destiny === 'male' ? 1.15 : 1;
-      const ration = Math.min(rivalColony.storedFood, dt * 0.0065 * rationMultiplier);
+      const requiredRation = dt * 0.0065 * rationMultiplier;
+      const ration = Math.min(rivalColony.storedFood, requiredRation);
       rivalColony.storedFood -= ration;
-      if (ration < dt * 0.0048 * rationMultiplier) development *= 0.36;
+      const rationRatio = ration / Math.max(0.0001, requiredRation);
+      if (rationRatio < 0.74) development *= 0.36;
+      item.starvation = clamp((item.starvation || 0)
+        + dt * Math.max(0, 0.72 - rationRatio) * 0.033
+        - dt * Math.max(0, rationRatio - 0.72) * 0.014, 0, 1.2);
+      if (item.starvation >= 1) {
+        rivalBrood.splice(i, 1);
+        rivalColony.broodDeaths++;
+        continue;
+      }
     }
-    item.stageAge += dt * development;
+    item.stageAge += dt * development * (1 - demographics.crowdingPressure * 0.52);
     if (item.stageAge < broodStageDuration(item)) continue;
     if (item.stage === 'egg') { item.stage = 'larva'; item.stageAge = 0; }
     else if (item.stage === 'larva') { item.stage = 'pupa'; item.stageAge = 0; }
     else {
-      rivalBrood.splice(i, 1);
       if (item.destiny === 'worker') {
-        if (spawnRival(true, { genome: item.genome, generation: item.generation, parentage: item.parentage })) rivalColony.workersEclosed++;
-      } else ecloseAlate(rivalReproduction, item, RIVAL_COLONY_ID, 'slate');
+        const worker = spawnRival(true, { genome: item.genome, generation: item.generation, parentage: item.parentage });
+        if (!worker) {
+          if (!item.technicalBlockReported) {
+            item.technicalBlockReported = true;
+            rivalColony.technicalBlockedEclosions++;
+          }
+          item.stageAge = broodStageDuration(item);
+          continue;
+        }
+        rivalColony.workersEclosed++;
+        rivalBrood.splice(i, 1);
+      } else {
+        rivalBrood.splice(i, 1);
+        ecloseAlate(rivalReproduction, item, RIVAL_COLONY_ID, 'slate');
+      }
     }
   }
   rivalColony.layClock -= dt;
+  demographics = demographicStateFor(rivalColonyRecord, rivalCareRatio);
+  rivalColonyRecord.demographics = demographics;
   if (rivalColony.layClock <= 0) {
-    if (rivalColony.storedFood > 24 && rivalBrood.length < 48 && environment.season.name !== 'winter') {
-      const sexualSeason = environment.season.name === 'spring' || environment.season.name === 'summer';
-      let destiny = 'worker';
-      if (sexualSeason && rivalAnts.length >= 55 && rivalColony.storedFood > 74
-        && rivalReproduction.reproductiveBudget >= reproductiveCost('male') && random() < 0.38) {
-        const candidate = chooseSexualDestiny(rivalReproduction);
-        if (rivalReproduction.reproductiveBudget >= reproductiveCost(candidate)) destiny = candidate;
-      }
-      const cost = reproductiveCost(destiny);
-      if (addRivalBrood('egg', 0, null, 1, { destiny })) {
-        rivalColony.eggsLaid++;
-        rivalColony.storedFood = Math.max(0, rivalColony.storedFood - cost);
-        if (destiny === 'worker') rivalReproduction.workerEggsLaid++;
-        else {
-          rivalReproduction.sexualEggsLaid++;
-          rivalReproduction.reproductiveBudget -= cost;
-          if (destiny === 'male') rivalReproduction.maleInvestment += cost;
-          else rivalReproduction.gyneInvestment += cost;
+    const canLay = demographics.layingDrive > 0.08
+      && rivalBrood.length < demographics.broodCapacity && rivalBrood.length < TECHNICAL_BROOD_LIMIT;
+    if (canLay) {
+      const availableBroodSpace = demographics.broodCapacity - rivalBrood.length;
+      const baseClutch = demographics.layingDrive > 0.7 && availableBroodSpace > 1 ? 2 : 1;
+      const clutch = Math.min(availableBroodSpace, baseClutch + (demographicScenario === 'abundance' ? 1 : 0));
+      for (let i = 0; i < clutch; i++) {
+        const sexualSeason = environment.season.name === 'spring' || environment.season.name === 'summer';
+        let destiny = 'worker';
+        if (sexualSeason && rivalAnts.length >= 55 && rivalColony.storedFood > 74
+          && rivalReproduction.reproductiveBudget >= reproductiveCost('male') && random() < 0.38) {
+          const candidate = chooseSexualDestiny(rivalReproduction);
+          if (rivalReproduction.reproductiveBudget >= reproductiveCost(candidate)) destiny = candidate;
+        }
+        const cost = reproductiveCost(destiny);
+        if (addRivalBrood('egg', 0, null, 1, { destiny })) {
+          rivalColony.eggsLaid++;
+          rivalColony.storedFood = Math.max(0, rivalColony.storedFood - cost);
+          if (destiny === 'worker') rivalReproduction.workerEggsLaid++;
+          else {
+            rivalReproduction.sexualEggsLaid++;
+            rivalReproduction.reproductiveBudget -= cost;
+            if (destiny === 'male') rivalReproduction.maleInvestment += cost;
+            else rivalReproduction.gyneInvestment += cost;
+          }
         }
       }
     }
-    rivalColony.layClock = rand(14, 21);
+    rivalColony.layClock = canLay
+      ? rand(8.5, 12.5) / clamp((0.6 + demographics.layingDrive * 0.58)
+        * (demographicScenario === 'abundance' ? 1.18 : 1), 0.6, 1.4)
+      : rand(4.8, 8);
   }
 
-  for (const rival of rivalAnts) updateRivalAnt(rival, dt);
-  for (let i = rivalAnts.length - 1; i >= 0; i--) if (!rivalAnts[i].alive) rivalAnts.splice(i, 1);
-  for (let i = 0; i < rivalAnts.length; i++) {
-    const rival = rivalAnts[i];
-    if (rival.insideNest) continue;
-    for (let j = i + 1; j < rivalAnts.length; j++) {
-      const other = rivalAnts[j];
-      if (other.insideNest) continue;
-      let dx = rival.x - other.x;
-      let dz = rival.z - other.z;
-      let distance = Math.hypot(dx, dz);
-      const minimum = 0.53 * (rival.size + other.size) * 0.5;
-      if (distance >= minimum) continue;
-      if (distance < 0.001) { dx = Math.cos(i * 2.3); dz = Math.sin(i * 2.3); distance = 1; }
-      const push = (minimum - distance) * 0.48;
-      rival.x += (dx / distance) * push;
-      rival.z += (dz / distance) * push;
-      other.x -= (dx / distance) * push;
-      other.z -= (dz / distance) * push;
+  for (const rival of rivalAnts) {
+    if (!rival.alive) continue;
+    const seniority = Math.max(0, rival.ageDays - WORKER_SENESCENCE_DAYS);
+    rival.health -= dt * seniority * WORKER_SENESCENCE_RATE * (rival.insideNest ? 0.72 : 1.18);
+    rival.health -= dt * demographics.starvationPressure * 0.07;
+    rival.health -= dt * demographics.crowdingPressure * 0.011;
+    if (rival.insideNest && demographics.reserveRatio > 0.6) rival.health = Math.min(100, rival.health + dt * 0.014);
+    if (rival.health <= 0) {
+      markRivalDead(rival, demographics.starvationPressure > 0.45 ? 'starvation'
+        : demographics.crowdingPressure > 0.6 ? 'crowding stress' : 'age');
+      continue;
     }
+    updateRivalAnt(rival, dt);
   }
+  for (let i = rivalAnts.length - 1; i >= 0; i--) if (!rivalAnts[i].alive) rivalAnts.splice(i, 1);
 }
 
 function updateColonyBiology(dt) {
+  storedFood = acceptColonyStoredFood(HOME_COLONY_ID, storedFood);
   const activeNurses = ants.filter((ant) => ant.insideNest && ant.nestRouteKey === 'nursery' && ant.nestMode === 'working').length;
   const requiredNurses = Math.max(2, Math.ceil(brood.length / 4.2));
   colonyBiology.activeNurses = activeNurses;
   colonyBiology.requiredNurses = requiredNurses;
   colonyBiology.starvedLarvae = 0;
 
-  const seasonalMetabolism = environment.season.name === 'winter' ? 1.3 : environment.season.name === 'summer' ? 1.08 : 1;
-  storedFood = Math.max(0, storedFood - dt * (0.012 + ants.length * 0.00022) * seasonalMetabolism);
+  storedFood = consumeColonyStoredFood(
+    HOME_COLONY_ID,
+    storedFood,
+    dt,
+    ants.length,
+    { baseRate: 0.018, workerRate: 0.0011 },
+  );
   updateAlateCohort(homeReproduction, dt);
   if ((environment.season.name === 'spring' || environment.season.name === 'summer') && storedFood > 65) {
     homeReproduction.reproductiveBudget = clamp(
@@ -4789,20 +5524,33 @@ function updateColonyBiology(dt) {
     );
   }
   const careRatio = clamp(activeNurses / requiredNurses, 0.35, 1.18);
+  let demographics = demographicStateFor(homeColonyRecord, careRatio);
+  homeColonyRecord.demographics = demographics;
   for (let i = brood.length - 1; i >= 0; i--) {
     const item = brood[i];
     let development = 0.58 + careRatio * 0.48;
     if (item.stage === 'larva') {
       const rationMultiplier = item.destiny === 'gyne' ? 1.9 : item.destiny === 'male' ? 1.15 : 1;
-      const ration = Math.min(storedFood, dt * 0.0085 * rationMultiplier);
+      const requiredRation = dt * 0.0085 * rationMultiplier;
+      const ration = Math.min(storedFood, requiredRation);
       storedFood -= ration;
-      if (ration < dt * 0.006 * rationMultiplier) {
+      const rationRatio = ration / Math.max(0.0001, requiredRation);
+      if (rationRatio < 0.71) {
         development *= 0.32;
         colonyBiology.starvedLarvae++;
       }
+      item.starvation = clamp((item.starvation || 0)
+        + dt * Math.max(0, 0.72 - rationRatio) * 0.033
+        - dt * Math.max(0, rationRatio - 0.72) * 0.014, 0, 1.2);
+      if (item.starvation >= 1) {
+        brood.splice(i, 1);
+        colonyBiology.broodDeaths++;
+        continue;
+      }
     }
     item.care = clamp(item.care + dt * (careRatio - 0.72) * 0.008, 0.62, 1.16);
-    item.stageAge += dt * development * item.care;
+    const crowdingDevelopment = 1 - demographics.crowdingPressure * 0.52;
+    item.stageAge += dt * development * item.care * crowdingDevelopment;
     if (item.stageAge < broodStageDuration(item)) continue;
     if (item.stage === 'egg') {
       item.stage = 'larva';
@@ -4811,21 +5559,40 @@ function updateColonyBiology(dt) {
       item.stage = 'pupa';
       item.stageAge = 0;
     } else {
-      brood.splice(i, 1);
-      if (item.destiny === 'worker' && ants.length < MAX_ANTS) {
-        if (spawnAnt(false, { newborn: true, ageDays: 0, genome: item.genome, generation: item.generation, parentage: item.parentage })) workersEclosed++;
-      } else if (item.destiny !== 'worker') ecloseAlate(homeReproduction, item, HOME_COLONY_ID, 'amber');
+      if (item.destiny === 'worker') {
+        const worker = spawnAnt(false, {
+          newborn: true, ageDays: 0, genome: item.genome,
+          generation: item.generation, parentage: item.parentage,
+        });
+        if (!worker) {
+          if (!item.technicalBlockReported) {
+            item.technicalBlockReported = true;
+            colonyBiology.technicalBlockedEclosions++;
+          }
+          item.stageAge = broodStageDuration(item);
+          continue;
+        }
+        workersEclosed++;
+        brood.splice(i, 1);
+      } else {
+        brood.splice(i, 1);
+        ecloseAlate(homeReproduction, item, HOME_COLONY_ID, 'amber');
+      }
     }
   }
 
   queenLayClock -= dt;
-  const nurseryCapacity = 18 + Math.round(tunnelSegments[1].progress * 42);
+  demographics = demographicStateFor(homeColonyRecord, careRatio);
+  homeColonyRecord.demographics = demographics;
   if (queenLayClock <= 0) {
     const safeToLay = environment.pressure === 'stable' || environment.pressure === 'predator alarm';
-    const canLay = storedFood > 22 && safeToLay && environment.season.name !== 'winter'
-      && brood.length < nurseryCapacity && ants.length + brood.length < MAX_ANTS + 18;
+    const canLay = safeToLay && demographics.layingDrive > 0.08
+      && brood.length < demographics.broodCapacity && brood.length < TECHNICAL_BROOD_LIMIT;
     if (canLay) {
-      const clutch = storedFood > 78 && activeNurses >= requiredNurses * 0.7 ? 2 : 1;
+      const availableBroodSpace = demographics.broodCapacity - brood.length;
+      const baseClutch = demographics.layingDrive > 0.72 && availableBroodSpace > 2
+        ? (demographics.reserveRatio > 1.5 ? 3 : 2) : 1;
+      const clutch = Math.min(availableBroodSpace, baseClutch + (demographicScenario === 'abundance' ? 1 : 0));
       for (let i = 0; i < clutch; i++) {
         const sexualSeason = environment.season.name === 'spring' || environment.season.name === 'summer';
         let destiny = 'worker';
@@ -4847,7 +5614,10 @@ function updateColonyBiology(dt) {
         }
       }
     }
-    queenLayClock = rand(13, 20) * (storedFood < 45 ? 1.35 : 1);
+    queenLayClock = canLay
+      ? rand(6, 9) / clamp((0.58 + demographics.layingDrive * 0.62)
+        * (demographicScenario === 'abundance' ? 1.18 : 1), 0.58, 1.42)
+      : rand(4.5, 7.5);
   }
 }
 
@@ -4861,7 +5631,7 @@ function depositInEntranceCache(ant) {
     entranceBiology.cache.push({
       kind: ant.carryingKind || 'seed',
       nutrition,
-      value: 2.5 * nutrition,
+      value: 1.35 * nutrition,
       seedSpecies: ant.carryingSeedSpecies || null,
       sourcePlantId: ant.carryingSourcePlantId || null,
     });
@@ -4896,6 +5666,7 @@ let laborClock = 99;
 const colonyLabor = {
   targetForagers: 0, targetNurses: 0, targetTransfers: 0, targetExcavators: 0, targetSanitizers: 0,
   assignedForagers: 0, assignedNurses: 0, assignedTransfers: 0, assignedExcavators: 0, assignedSanitizers: 0,
+  assignedInterior: 0,
 };
 function updateLaborAssignments(dt) {
   laborClock += dt;
@@ -4903,7 +5674,9 @@ function updateLaborAssignments(dt) {
   laborClock = 0;
   const projects = activeConstructionProjects();
   const broodPressure = brood.length / Math.max(1, ants.length);
-  const foodPressure = clamp((62 - storedFood) / 62, 0, 1);
+  const demographics = demographicStateFor(homeColonyRecord, 1);
+  const foodPressure = clamp((1.28 - demographics.reserveRatio) / 1.08, 0, 1);
+  const reserveSurplus = clamp((demographics.reserveRatio - 2.4) / 3.2, 0, 1);
   const survivalEmergency = environment.pressure === 'food crisis' || environment.pressure === 'disease outbreak' || environment.season.name === 'winter';
   const targetExcavators = projects.length > 0
     ? clamp(Math.round(ants.length * (survivalEmergency ? 0.018 : 0.045 + (storedFood > 45 ? 0.02 : 0))), 2, 14)
@@ -4913,7 +5686,11 @@ function updateLaborAssignments(dt) {
     ? clamp(Math.ceil(entranceBiology.cache.length / 5), 2, 10)
     : 1;
   const targetSanitizers = remains.length > 0 ? clamp(Math.ceil(remains.length / 3), 2, 6) : 0;
-  const targetForagers = Math.max(0, ants.length - targetNurses - targetTransfers - targetExcavators - targetSanitizers);
+  const seasonalSurfaceFactor = environment.season.name === 'winter' ? 0.48 : environment.season.name === 'autumn' ? 0.78 : 1;
+  const forageFraction = clamp((0.14 - reserveSurplus * 0.07 + foodPressure * 0.34
+    + entranceBiology.activation * 0.06) * seasonalSurfaceFactor, 0.06, 0.56);
+  const availableAfterSpecialists = Math.max(0, ants.length - targetNurses - targetTransfers - targetExcavators - targetSanitizers);
+  const targetForagers = Math.min(availableAfterSpecialists, clamp(Math.round(ants.length * forageFraction), 7, Math.round(ants.length * 0.56)));
   colonyLabor.targetExcavators = targetExcavators;
   colonyLabor.targetNurses = targetNurses;
   colonyLabor.targetTransfers = targetTransfers;
@@ -4970,13 +5747,15 @@ function updateLaborAssignments(dt) {
   claimRole('transfer', targetTransfers);
   claimRole('excavator', targetExcavators);
   claimRole('sanitizer', targetSanitizers);
-  for (const ant of ants) if (!claimed.has(ant)) ant.assignedRole = 'forager';
+  claimRole('forager', targetForagers);
+  for (const ant of ants) if (!claimed.has(ant)) ant.assignedRole = 'interior';
 
   colonyLabor.assignedForagers = ants.filter((ant) => ant.assignedRole === 'forager').length;
   colonyLabor.assignedNurses = ants.filter((ant) => ant.assignedRole === 'nurse').length;
   colonyLabor.assignedTransfers = ants.filter((ant) => ant.assignedRole === 'transfer' || ant.transferCargo).length;
   colonyLabor.assignedExcavators = ants.filter((ant) => ant.assignedRole === 'excavator').length;
   colonyLabor.assignedSanitizers = ants.filter((ant) => ant.assignedRole === 'sanitizer' || ant.sanitationCargo).length;
+  colonyLabor.assignedInterior = ants.filter((ant) => ant.assignedRole === 'interior').length;
 }
 
 const obstacles = [
@@ -4984,9 +5763,11 @@ const obstacles = [
   { x: 8.0, z: -0.1, r: 0.38 },
 ];
 
-const ANT_CELL_SIZE = 0.72;
+const ANT_CELL_SIZE = 1.12;
 const ANT_GRID_ROWS = Math.ceil(WORLD_D / ANT_CELL_SIZE) + 4;
-const antSpatialGrid = new Map();
+const surfaceWorkerGrid = new Map();
+let indexedSurfaceWorkers = [];
+const surfaceWorkerIndices = new WeakMap();
 
 function antCellCoords(x, z) {
   return {
@@ -4997,22 +5778,35 @@ function antCellCoords(x, z) {
 
 function antCellKey(x, z) { return x * ANT_GRID_ROWS + z; }
 
-function rebuildAntSpatialGrid() {
-  antSpatialGrid.clear();
-  for (let i = 0; i < ants.length; i++) {
-    if (ants[i].insideNest) continue;
-    const cell = antCellCoords(ants[i].x, ants[i].z);
-    const key = antCellKey(cell.x, cell.z);
-    let occupants = antSpatialGrid.get(key);
-    if (!occupants) {
-      occupants = [];
-      antSpatialGrid.set(key, occupants);
+function rebuildSurfaceWorkerGrid() {
+  surfaceWorkerGrid.clear();
+  indexedSurfaceWorkers = [];
+  for (const colony of colonyRegistry.values()) {
+    if (colony.status === 'extinct') continue;
+    for (const worker of colony.workers) {
+      if (worker.alive === false || worker.insideNest) continue;
+      surfaceWorkerIndices.set(worker, indexedSurfaceWorkers.length);
+      indexedSurfaceWorkers.push(worker);
+      const cell = antCellCoords(worker.x, worker.z);
+      const key = antCellKey(cell.x, cell.z);
+      let occupants = surfaceWorkerGrid.get(key);
+      if (!occupants) {
+        occupants = [];
+        surfaceWorkerGrid.set(key, occupants);
+      }
+      occupants.push(worker);
     }
-    occupants.push(i);
   }
 }
 
+function workersInCombatContact(a, b) {
+  return a.colonyId !== b.colonyId
+    && (a.combatContactUntil || 0) > simTime
+    && (b.combatContactUntil || 0) > simTime;
+}
+
 function applyNeighborAvoidance(ant) {
+  if (ant.insideNest) return;
   const cell = antCellCoords(ant.x, ant.z);
   let separateX = 0;
   let separateZ = 0;
@@ -5021,30 +5815,32 @@ function applyNeighborAvoidance(ant) {
 
   for (let ox = -1; ox <= 1; ox++) {
     for (let oz = -1; oz <= 1; oz++) {
-      const occupants = antSpatialGrid.get(antCellKey(cell.x + ox, cell.z + oz));
+      const occupants = surfaceWorkerGrid.get(antCellKey(cell.x + ox, cell.z + oz));
       if (!occupants) continue;
-      for (const index of occupants) {
-        const other = ants[index];
-        if (other === ant) continue;
+      for (const other of occupants) {
+        if (other === ant || other.insideNest) continue;
         let dx = ant.x - other.x;
         let dz = ant.z - other.z;
         let distanceSq = dx * dx + dz * dz;
         const opposing = Math.cos(ant.heading - other.heading) < -0.25;
-        const personalSpace = (opposing ? 0.92 : 0.78) * (ant.size + other.size) * 0.5;
+        const combatContact = workersInCombatContact(ant, other);
+        const crossColony = ant.colonyId !== other.colonyId;
+        const baseSpace = combatContact ? 0.44 : crossColony ? 0.9 : opposing ? 0.96 : 0.84;
+        const personalSpace = baseSpace * ((ant.size || 0.8) + (other.size || 0.8)) * 0.5;
         if (distanceSq >= personalSpace * personalSpace) continue;
         if (distanceSq < 0.00001) {
-          const fallback = ant.phase * 1.71 - other.phase * 0.63;
+          const fallback = (ant.phase || ant.id || 1) * 1.71 - (other.phase || other.id || 1) * 0.63;
           dx = Math.cos(fallback) * 0.01;
           dz = Math.sin(fallback) * 0.01;
           distanceSq = 0.0001;
         }
         const distance = Math.sqrt(distanceSq);
-        const strength = 1 - distance / personalSpace;
+        const strength = (1 - distance / personalSpace) * (combatContact ? 0.16 : 1);
         separateX += (dx / distance) * strength;
         separateZ += (dz / distance) * strength;
-        if (opposing) {
-          separateX += -Math.sin(ant.heading) * Math.sign(ant.laneBias || 1) * strength * 0.42;
-          separateZ += Math.cos(ant.heading) * Math.sign(ant.laneBias || 1) * strength * 0.42;
+        if (opposing && !combatContact) {
+          separateX += -Math.sin(ant.heading) * Math.sign(ant.laneBias || 1) * strength * 0.46;
+          separateZ += Math.cos(ant.heading) * Math.sign(ant.laneBias || 1) * strength * 0.46;
         }
         pressure += strength;
         neighbors++;
@@ -5053,32 +5849,34 @@ function applyNeighborAvoidance(ant) {
   }
 
   if (neighbors > 0) {
-    const routeWeight = ant.carrying ? 1.15 : 1;
-    const desiredX = Math.cos(ant.desired) * routeWeight + separateX * 1.65;
-    const desiredZ = Math.sin(ant.desired) * routeWeight + separateZ * 1.65;
+    const routeWeight = ant.carrying ? 1.18 : 1;
+    const desiredX = Math.cos(ant.desired) * routeWeight + separateX * 1.78;
+    const desiredZ = Math.sin(ant.desired) * routeWeight + separateZ * 1.78;
     ant.desired = Math.atan2(desiredZ, desiredX);
-    if (pressure > 1.35) ant.state = 'weaving through traffic';
+    if (pressure > 1.45 && !(ant.combatContactUntil > simTime)) ant.state = 'weaving through traffic';
   }
 }
 
-function resolveAntSpacing() {
-  rebuildAntSpatialGrid();
-  for (let i = 0; i < ants.length; i++) {
-    const ant = ants[i];
+function resolveSurfaceWorkerSpacing() {
+  rebuildSurfaceWorkerGrid();
+  for (let i = 0; i < indexedSurfaceWorkers.length; i++) {
+    const ant = indexedSurfaceWorkers[i];
     if (ant.insideNest) continue;
     const cell = antCellCoords(ant.x, ant.z);
     for (let ox = -1; ox <= 1; ox++) {
       for (let oz = -1; oz <= 1; oz++) {
-        const occupants = antSpatialGrid.get(antCellKey(cell.x + ox, cell.z + oz));
+        const occupants = surfaceWorkerGrid.get(antCellKey(cell.x + ox, cell.z + oz));
         if (!occupants) continue;
-        for (const otherIndex of occupants) {
-          if (otherIndex <= i) continue;
-          const other = ants[otherIndex];
-          if (other.insideNest) continue;
+        for (const other of occupants) {
+          const otherIndex = surfaceWorkerIndices.get(other);
+          if (otherIndex == null || otherIndex <= i || other.insideNest) continue;
           let dx = ant.x - other.x;
           let dz = ant.z - other.z;
           let distance = Math.hypot(dx, dz);
-          const minimum = 0.68 * (ant.size + other.size) * 0.5;
+          const combatContact = workersInCombatContact(ant, other);
+          const crossColony = ant.colonyId !== other.colonyId;
+          const baseMinimum = combatContact ? 0.38 : crossColony ? 0.86 : 0.78;
+          const minimum = baseMinimum * ((ant.size || 0.8) + (other.size || 0.8)) * 0.5;
           if (distance >= minimum) continue;
           if (distance < 0.001) {
             const angle = (i * 2.399 + otherIndex * 0.73) % (Math.PI * 2);
@@ -5140,6 +5938,7 @@ function emergeFromNest(ant) {
 }
 
 function moveSurfaceDirected(ant, dt, speedFactor = 1) {
+  applyNeighborAvoidance(ant);
   const turnRate = dt * 4.6;
   ant.heading += clamp(wrapAngle(ant.desired - ant.heading), -turnRate, turnRate);
   const velocity = ant.speed * speedFactor * (1 - weather.rain * 0.18) * webSlowAt(ant.x, ant.z);
@@ -5301,14 +6100,18 @@ function updateNestAnt(ant, dt) {
       if (ant.assignedRole === 'forager') {
         ant.state = ant.pendingDelivery ? 'waiting for cache space' : 'waiting for successful returner contacts';
         if (ant.nestTimer <= 0 && !ant.pendingDelivery) {
-          const foodPressure = clamp((62 - storedFood) / 62, 0, 1);
+          const reserveRatio = homeColonyRecord.demographics?.reserveRatio || 0;
+          const foodPressure = clamp((1.28 - reserveRatio) / 1.08, 0, 1);
+          const emergencyExploration = reserveRatio < 0.58;
           const weatherSuppression = weather.rain * 0.72 + (environment.season.name === 'winter' ? 0.28 : 0);
           const stimulus = 0.18 + entranceBiology.activation * 0.72 + entranceBiology.recentReturns * 0.34
-            + foodPressure * 0.2 + ant.genome.foraging * 0.1 - weatherSuppression;
+            + foodPressure * 0.58 + ant.genome.foraging * 0.1 - weatherSuppression;
           const threshold = ant.responseThresholds?.forager ?? 0.5;
-          if (stimulus + rand(-0.12, 0.12) >= threshold) {
+          if (emergencyExploration || stimulus + rand(-0.12, 0.12) >= threshold) {
             entranceBiology.activatedDepartures++;
-            ant.state = 'activated by returning foragers';
+            ant.state = emergencyExploration
+              ? 'reserves critical; beginning independent exploratory forage'
+              : 'activated by returning foragers';
             ant.nestMode = 'traveling';
             ant.nestDirection = -1;
             ant.nestLeg = route.legs.length - 1;
@@ -5324,6 +6127,11 @@ function updateNestAnt(ant, dt) {
       }
       if (ant.nestTimer <= 0) {
         if (ant.assignedRole === 'nurse' && brood.length > 0) beginNestJourney(ant, 'nursery');
+        else if (ant.assignedRole === 'interior') {
+          beginNestJourney(ant, 'rest', true);
+          ant.nestTimer = rand(4.5, 10.5);
+          ant.state = 'circulating back into the interior reserve';
+        }
         else {
           ant.nestMode = 'traveling';
           ant.nestDirection = -1;
@@ -5338,7 +6146,7 @@ function updateNestAnt(ant, dt) {
       ant.state = 'unloading transferred food in stores';
       if (ant.transferCargo) {
         delivered++;
-        storedFood = Math.min(180, storedFood + ant.transferCargo.value);
+        storedFood = acceptColonyStoredFood(HOME_COLONY_ID, storedFood, ant.transferCargo.value);
         storeSeedCargo(HOME_COLONY_ID, ant.transferCargo);
         entranceBiology.storageTransfers++;
         ant.transferCargo = null;
@@ -5356,6 +6164,12 @@ function updateNestAnt(ant, dt) {
         ant.tasksCompleted++;
         ant.taskExperience.nurse += 1;
         ant.state = 'repositioning brood in nursery';
+        return;
+      }
+      if (ant.assignedRole === 'interior') {
+        ant.nestTimer = rand(4.2, 9.8);
+        ant.state = 'inspecting and resting in the interior galleries';
+        ant.nestExplorationTrips = (ant.nestExplorationTrips || 0) + 1;
         return;
       }
       ant.nestMode = 'traveling';
@@ -5411,6 +6225,9 @@ function updateNestAnt(ant, dt) {
         beginNestJourney(ant, 'vestibule', true);
         ant.nestTimer = rand(1.2, 3.4);
         ant.state = 'entering vestibule before departure';
+      } else if (ant.assignedRole === 'interior') {
+        beginNestJourney(ant, 'rest', true);
+        ant.nestTimer = rand(4.2, 9.8);
       } else emergeFromNest(ant);
     }
     else {
@@ -5426,7 +6243,7 @@ function updateAnt(ant, dt) {
   ant.borderCooldown -= dt;
   ant.turnClock -= dt;
   ant.pause -= dt;
-  ant.ageDays += dt / 720;
+  ant.ageDays += dt * SIM_DAYS_PER_SECOND;
 
   if (ant.insideNest) {
     updateNestAnt(ant, dt);
@@ -5501,6 +6318,17 @@ function updateAnt(ant, dt) {
     return;
   }
 
+  if (ant.assignedRole === 'interior' && !ant.carrying) {
+    ant.state = 'returning to the interior reserve';
+    steerTowards(ant, Math.atan2(nestDz, nestDx) + ant.laneBias * 0.28, 0.9);
+    if (nestDistance < 0.77) {
+      beginNestJourney(ant, 'rest');
+      return;
+    }
+    moveSurfaceDirected(ant, dt, 1.04);
+    return;
+  }
+
   if (ant.carrying) {
     ant.state = weather.rain > 0.68 ? 'hurrying home' : 'carrying food';
     const homeAngle = Math.atan2(nestDz, nestDx) + Math.sin(ant.phase * 0.21) * 0.055 + ant.laneBias * 0.34;
@@ -5529,15 +6357,16 @@ function updateAnt(ant, dt) {
       const pC = pherSample(ant.x + Math.cos(ant.heading) * look, ant.z + Math.sin(ant.heading) * look);
       const pR = pherSample(ant.x + Math.cos(ant.heading + side) * look, ant.z + Math.sin(ant.heading + side) * look);
       const strongest = Math.max(pL, pC, pR);
+      expireStaleForagingMemory(ant, homeForagingNetwork);
       const sector = chooseForagingSector(ant, homeForagingNetwork);
+      const searchTarget = foragingSearchTarget(ant, homeForagingNetwork, sector);
       const privateWeight = navigation.confidence * (0.55 + flightLightLevel() * 0.85);
       const socialWeight = strongest * 0.42 + sector.socialPulse * 0.32 + entranceBiology.activation * 0.08;
       if (navigation.rememberedX != null && privateWeight > socialWeight && navigation.searchTime < 18) {
-        const memoryAngle = Math.atan2(navigation.rememberedZ - ant.z, navigation.rememberedX - ant.x);
+        const memoryAngle = Math.atan2(searchTarget.z - ant.z, searchTarget.x - ant.x);
         steerTowards(ant, memoryAngle + ant.laneBias * 0.22, 0.82);
         ant.state = 'following private route memory';
         navigation.guidance = 'private route memory';
-        navigation.searchTime += dt;
         homeForagingNetwork.memoryGuidedSteps += dt;
       } else if (strongest > 0.035 / ant.genome.foraging && random() < clamp(0.72 + ant.genome.foraging * 0.15, 0.78, 0.93)) {
         ant.state = 'following scent';
@@ -5547,31 +6376,23 @@ function updateAnt(ant, dt) {
         if (pL > pC && pL > pR) offset = -side;
         else if (pR > pC) offset = side;
         steerTowards(ant, ant.heading + offset + ant.laneBias * 0.5 + rand(-0.09, 0.09), 0.66);
-      } else if (sector.socialPulse > 0.12) {
-        const target = sectorTarget(homeForagingNetwork, sector);
-        steerTowards(ant, Math.atan2(target.z - ant.z, target.x - ant.x) + ant.laneBias * 0.3, 0.72);
+      } else if (sector.socialPulse > 0.12 && !sector.stale) {
+        steerTowards(ant, Math.atan2(searchTarget.z - ant.z, searchTarget.x - ant.x) + ant.laneBias * 0.3, 0.72);
         ant.state = 'following social sector information';
         navigation.guidance = 'social sector activation';
         homeForagingNetwork.socialGuidedSteps += dt;
       } else {
-        navigation.searchTime += dt;
-        if (navigation.searchTime > 20) {
-          recordForagingFailure(ant);
-          navigation.searchTime = 0;
-        }
         ant.state = (weather.rain > 0.72 || ant.energy < 30) && nestDistance > 2 ? 'returning to nest' : 'exploring';
         if ((weather.rain > 0.72 || ant.energy < 30) && nestDistance > 2) {
           steerTowards(ant, Math.atan2(nestDz, nestDx), 0.42);
-        } else if (ant.turnClock <= 0) {
-          const searchTarget = sectorTarget(homeForagingNetwork, sector);
+        } else {
           const sectorAngle = Math.atan2(searchTarget.z - ant.z, searchTarget.x - ant.x);
-          const exploratory = sectorAngle + rand(-0.52, 0.52);
-          const targetAngle = nestDistance < 2.0 ? sectorAngle + rand(-0.28, 0.28) : exploratory;
+          const targetAngle = sectorAngle + Math.sin(ant.phase * 0.07 + ant.id) * (nestDistance < 2 ? 0.18 : 0.34);
           steerTowards(ant, targetAngle, 0.72);
           navigation.guidance = 'sector exploration';
-          ant.turnClock = rand(0.3, 1.7);
         }
       }
+      advanceForagingSearch(ant, homeForagingNetwork, sector, dt);
     }
   }
 
@@ -5618,38 +6439,47 @@ function renderAnts() {
   let carryingCount = 0;
   let soilCarryingCount = 0;
   let visibleCount = 0;
+  let shadowCount = 0;
   const pos = new THREE.Vector3();
   const q = new THREE.Quaternion();
   const groundTilt = new THREE.Quaternion();
   const headingSpin = new THREE.Quaternion();
   const normal = new THREE.Vector3();
   const s = new THREE.Vector3();
+  const conditionColor = new THREE.Color();
+  const healthyColor = new THREE.Color(0xffffff);
+  const infectionColor = new THREE.Color(0x72516f);
+  const injuryColor = new THREE.Color(0x9b6a58);
   for (let i = 0; i < ants.length; i++) {
     const ant = ants[i];
     if (ant.insideNest) continue;
-    const frame = Math.floor(ant.phase) % 4;
+    const frame = visualFrameForPhase(ant.phase);
     const index = frameCounts[frame]++;
     antInstanceLookup[frame][index] = ant;
     const bob = Math.sin(ant.phase * Math.PI * 0.5) * 0.012;
     pos.set(ant.x, groundHeight(ant.x, ant.z) + 0.105 + bob, ant.z);
-    groundTilt.setFromUnitVectors(Y_AXIS, groundNormal(ant.x, ant.z, normal));
+    if (adaptiveVisualState.useTerrainNormals) groundTilt.setFromUnitVectors(Y_AXIS, groundNormal(ant.x, ant.z, normal));
+    else groundTilt.identity();
     headingSpin.setFromAxisAngle(Y_AXIS, -ant.heading - Math.PI / 2);
     q.copy(groundTilt).multiply(headingSpin);
     const pulse = 1 + Math.sin(ant.phase * Math.PI) * 0.018;
     s.setScalar(ant.size * pulse);
     matrix.compose(pos, q, s);
     antMeshes[frame].setMatrixAt(index, matrix);
-    const conditionColor = ant.infection > 0
-      ? new THREE.Color(0x8a7460).lerp(new THREE.Color(0x72516f), ant.infection)
-      : new THREE.Color(0xffffff).lerp(new THREE.Color(0x9b6a58), clamp((65 - ant.health) / 50, 0, 0.7));
+    conditionColor.copy(ant.infection > 0 ? injuryColor : healthyColor).lerp(
+      ant.infection > 0 ? infectionColor : injuryColor,
+      ant.infection > 0 ? ant.infection : clamp((65 - ant.health) / 50, 0, 0.7),
+    );
     antMeshes[frame].setColorAt(index, conditionColor);
 
-    matrix.compose(
-      new THREE.Vector3(ant.x, groundHeight(ant.x, ant.z) + 0.038, ant.z),
-      groundTilt,
-      new THREE.Vector3(ant.size * 1.05, ant.size * 1.05, ant.size * 1.05),
-    );
-    antShadows.setMatrixAt(visibleCount, matrix);
+    if (visibleCount % adaptiveVisualState.shadowStride === 0) {
+      matrix.compose(
+        new THREE.Vector3(ant.x, groundHeight(ant.x, ant.z) + 0.038, ant.z),
+        groundTilt,
+        new THREE.Vector3(ant.size * 1.05, ant.size * 1.05, ant.size * 1.05),
+      );
+      antShadows.setMatrixAt(shadowCount++, matrix);
+    }
 
     if (ant.carrying) {
       const fx = ant.x + Math.cos(ant.heading) * 0.29;
@@ -5678,12 +6508,13 @@ function renderAnts() {
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
   });
-  antShadows.count = visibleCount;
+  antShadows.count = shadowCount;
   antShadows.instanceMatrix.needsUpdate = true;
   carryMesh.count = carryingCount;
   carryMesh.instanceMatrix.needsUpdate = true;
   soilCarryMesh.count = soilCarryingCount;
   soilCarryMesh.instanceMatrix.needsUpdate = true;
+  adaptiveVisualState.renderedHomeWorkers = visibleCount;
 }
 
 function renderRivals() {
@@ -5695,18 +6526,24 @@ function renderRivals() {
   const groundTilt = new THREE.Quaternion();
   const headingSpin = new THREE.Quaternion();
   const normal = new THREE.Vector3();
+  const rivalColor = new THREE.Color();
+  const rivalHealthy = new THREE.Color(0xffffff);
+  const rivalInjured = new THREE.Color(0xc2736b);
+  let visibleCount = 0;
   for (const rival of rivalAnts) {
     if (!rival.alive || rival.insideNest) continue;
-    const frame = Math.floor(rival.phase) % 4;
+    const frame = visualFrameForPhase(rival.phase);
     const index = frameCounts[frame]++;
     rivalInstanceLookup[frame][index] = rival;
     pos.set(rival.x, groundHeight(rival.x, rival.z) + 0.11 + Math.sin(rival.phase) * 0.009, rival.z);
-    groundTilt.setFromUnitVectors(Y_AXIS, groundNormal(rival.x, rival.z, normal));
+    if (adaptiveVisualState.useTerrainNormals) groundTilt.setFromUnitVectors(Y_AXIS, groundNormal(rival.x, rival.z, normal));
+    else groundTilt.identity();
     headingSpin.setFromAxisAngle(Y_AXIS, -rival.heading - Math.PI / 2);
     orientation.copy(groundTilt).multiply(headingSpin);
     matrix.compose(pos, orientation, new THREE.Vector3(rival.size, rival.size, rival.size));
     rivalMeshes[frame].setMatrixAt(index, matrix);
-    rivalMeshes[frame].setColorAt(index, new THREE.Color(0xffffff).lerp(new THREE.Color(0xc2736b), clamp((62 - rival.health) / 48, 0, 0.72)));
+    rivalColor.copy(rivalHealthy).lerp(rivalInjured, clamp((62 - rival.health) / 48, 0, 0.72));
+    rivalMeshes[frame].setColorAt(index, rivalColor);
     if (rival.carrying) {
       const fx = rival.x + Math.cos(rival.heading) * 0.29;
       const fz = rival.z + Math.sin(rival.heading) * 0.29;
@@ -5717,6 +6554,7 @@ function renderRivals() {
       );
       rivalCarryMesh.setMatrixAt(carryingCount++, matrix);
     }
+    visibleCount++;
   }
   rivalMeshes.forEach((mesh, frame) => {
     mesh.count = frameCounts[frame];
@@ -5725,6 +6563,7 @@ function renderRivals() {
   });
   rivalCarryMesh.count = carryingCount;
   rivalCarryMesh.instanceMatrix.needsUpdate = true;
+  adaptiveVisualState.renderedRivalWorkers = visibleCount;
 }
 
 function antWorldPosition(ant, out = new THREE.Vector3()) {
@@ -5934,6 +6773,65 @@ function addObstacle(x, z) {
   createSignal(x, z, 0xa58f6a);
 }
 
+function recordEcologicalCheckpoint() {
+  if (simTime < ecologicalBalance.nextCheckpointAt) return;
+  ecologicalBalance.nextCheckpointAt = simTime + SEASON_SECONDS * 0.5;
+  const activeFood = foods.filter((food) => food.amount > 0);
+  ecologicalBalance.samples.push({
+    time: Number(simTime.toFixed(1)),
+    year: Number((simTime / ECOLOGICAL_YEAR_SECONDS).toFixed(2)),
+    season: environment.season.name,
+    totalWorkers: totalActiveWorkers(),
+    livingColonies: livingColonies().length,
+    surfaceFoodUnits: Number(activeFood.reduce((sum, food) => sum + food.amount * food.nutrition, 0).toFixed(1)),
+    activeFoodSources: activeFood.length,
+    livingPlants: vegetationEcology.plants.filter((plant) => plant.alive).length,
+    colonies: livingColonies().map((colony) => ({
+      id: colony.id,
+      status: colony.status,
+      workers: colony.workers.filter((worker) => worker.alive !== false).length,
+      brood: colony.brood.length,
+      storedFood: Number(colony.storedFood.toFixed(1)),
+      reserveRatio: Number((colony.demographics?.reserveRatio || 0).toFixed(2)),
+      workersEclosed: colony.workersEclosed,
+      deaths: colony.deaths,
+    })),
+  });
+  if (ecologicalBalance.samples.length > 40) ecologicalBalance.samples.shift();
+}
+
+function ecologicalEquilibriumSummary() {
+  const samples = ecologicalBalance.samples;
+  const latest = samples.at(-1) || null;
+  const comparison = [...samples].reverse().find((sample) => latest && latest.time - sample.time >= ECOLOGICAL_YEAR_SECONDS * 0.8)
+    || samples[0] || null;
+  const elapsed = latest && comparison ? latest.time - comparison.time : 0;
+  const populationTrendPerYear = elapsed > 0
+    ? (latest.totalWorkers - comparison.totalWorkers) * ECOLOGICAL_YEAR_SECONDS / elapsed : 0;
+  const activeFood = foods.filter((food) => food.amount > 0);
+  const activeWorkers = totalActiveWorkers();
+  return {
+    ecologicalYear: Number((simTime / ECOLOGICAL_YEAR_SECONDS).toFixed(2)),
+    calendar: `${environment.season.name} · ${Math.round(environment.seasonProgress * 100)}%`,
+    checkpointCount: samples.length,
+    populationTrendPerYear: Number(populationTrendPerYear.toFixed(1)),
+    trendAssessment: activeWorkers === 0 ? 'worker population collapsed'
+      : elapsed < ECOLOGICAL_YEAR_SECONDS * 0.5 ? 'collecting baseline'
+      : Math.abs(populationTrendPerYear) < Math.max(12, activeWorkers * 0.08) ? 'near dynamic equilibrium'
+        : populationTrendPerYear > 0 ? 'expanding' : 'contracting',
+    surfaceFoodUnits: Number(activeFood.reduce((sum, food) => sum + food.amount * food.nutrition, 0).toFixed(1)),
+    activeFoodSources: activeFood.length,
+    retainedFoodRecords: foods.length,
+    depletedFoodRetired: ecologicalBalance.depletedFoodRetired,
+    storageOverflow: Object.fromEntries(ecologicalBalance.storageOverflow),
+    storedFoodMetabolized: Object.fromEntries([...ecologicalBalance.storedFoodMetabolized]
+      .map(([colonyId, amount]) => [colonyId, Number(amount.toFixed(1))])),
+    storedFoodSpoiled: Object.fromEntries([...ecologicalBalance.storedFoodSpoiled]
+      .map(([colonyId, amount]) => [colonyId, Number(amount.toFixed(1))])),
+    recentCheckpoints: samples.slice(-10),
+  };
+}
+
 // ---------- simulation loop ----------
 let spawnClock = 0;
 let foodClock = 0;
@@ -5967,8 +6865,10 @@ function update(dt) {
   simTime += dt;
   spawnClock += dt;
   foodClock += dt;
-  const seasonalFoodInterval = 27 / environment.season.food;
-  if (foodClock > seasonalFoodInterval && foods.filter((f) => f.amount > 0).length < Math.ceil(2 + environment.season.food * 2)) {
+  const seasonalFoodInterval = 27 / environment.season.food / (demographicScenario === 'abundance' ? 1.45 : 1);
+  if (demographicScenario !== 'scarcity' && foodClock > seasonalFoodInterval
+    && foods.filter((f) => f.amount > 0).length < Math.ceil(2 + environment.season.food * 2
+      + (demographicScenario === 'abundance' ? 2 : 0))) {
     foodClock = 0;
     const roll = random();
     const kind = environment.season.name === 'winter' ? (roll < 0.72 ? 'seed' : 'crumb')
@@ -5976,7 +6876,7 @@ function update(dt) {
     const seedSpecies = kind === 'seed' ? Object.keys(PLANT_PROFILES)[Math.floor(random() * Object.keys(PLANT_PROFILES).length)] : null;
     addFood(
       rand(-12, 13), rand(-9, 9), kind,
-      Math.floor(rand(34, 72) * environment.season.food), rand(1.2, 1.7),
+      Math.floor(rand(34, 72) * environment.season.food * RESOURCE_ABUNDANCE_FACTOR), rand(1.2, 1.7),
       kind === 'seed' ? { source: 'regional seed rain', seedSpecies } : { source: 'incidental seasonal food' },
     );
   }
@@ -5985,6 +6885,8 @@ function update(dt) {
   updateSpider(dt);
   updateWeather(dt);
   updateVegetationEcology(dt);
+  retireDepletedFoodRecords();
+  rebuildSurfaceWorkerGrid();
   updateNuptialFlight(dt);
   updatePheromones(dt);
   updateForagingNetworks(dt);
@@ -5992,15 +6894,17 @@ function update(dt) {
   refreshConstructionProjects();
   updateLaborAssignments(dt);
   updateColonyBiology(dt);
+  rebuildSurfaceWorkerGrid();
   updateRivalColony(dt);
   updateColonyArchitectures(dt);
-  rebuildAntSpatialGrid();
+  rebuildSurfaceWorkerGrid();
   for (const ant of ants) updateAnt(ant, dt);
   removeDeadWorkers();
-  resolveAntSpacing();
+  resolveSurfaceWorkerSpacing();
   updateAtmosphere(dt);
   updateUnderground();
   updateSelection(dt);
+  recordEcologicalCheckpoint();
 
   const day = (Math.sin(simTime * 0.027) + 1) * 0.5;
   viewState.surfaceSun = 2.15 + day * 2.15 - weather.rain * 1.0;
@@ -6079,8 +6983,18 @@ function updateCamera(dt) {
 }
 
 function render() {
-  renderAnts();
-  renderRivals();
+  updateAdaptiveVisualDetail();
+  if (surfaceGroup.visible) {
+    renderAnts();
+    renderRivals();
+    renderRegionalReproductionVisuals();
+  } else {
+    adaptiveVisualState.renderedHomeWorkers = 0;
+    adaptiveVisualState.renderedRivalWorkers = 0;
+    adaptiveVisualState.renderedDescendantWorkers = 0;
+  }
+  adaptiveVisualState.renderedSurfaceWorkers = adaptiveVisualState.renderedHomeWorkers
+    + adaptiveVisualState.renderedRivalWorkers + adaptiveVisualState.renderedDescendantWorkers;
   renderer.render(scene, camera);
 }
 
@@ -6118,7 +7032,7 @@ function groundPoint(clientX, clientY) {
 function antAtPointer(clientX, clientY) {
   setPointer(clientX, clientY);
   if (viewState.undergroundBlend < 0.5) {
-    const hits = raycaster.intersectObjects([...antMeshes, ...rivalMeshes], false);
+    const hits = raycaster.intersectObjects([...antMeshes, ...rivalMeshes, ...youngWorkerMeshes], false);
     for (const hit of hits) {
       const homeFrame = antMeshes.indexOf(hit.object);
       if (homeFrame >= 0) {
@@ -6129,6 +7043,11 @@ function antAtPointer(clientX, clientY) {
       if (rivalFrame >= 0) {
         const rival = rivalInstanceLookup[rivalFrame]?.[hit.instanceId];
         if (rival) return rival;
+      }
+      const youngFrame = youngWorkerMeshes.indexOf(hit.object);
+      if (youngFrame >= 0) {
+        const worker = youngWorkerInstanceLookup[youngFrame]?.[hit.instanceId];
+        if (worker) return worker;
       }
     }
   } else {
@@ -6287,6 +7206,25 @@ function findWorkerByIdentity(identity) {
 window.selectAntById = (id) => selectAnt(findWorkerByIdentity(id));
 window.focusColonyById = (id) => focusCameraOnColony(getColony(String(id)));
 
+function demographicSummary(colony) {
+  const state = colony.demographics || demographicStateFor(colony);
+  if (!state) return null;
+  return {
+    regulation: 'food + nursery space + excavated worker space + queen rate + mortality',
+    workerSpace: { used: state.workers, available: state.workerCapacity, occupancy: Number(state.occupancy.toFixed(2)) },
+    broodSpace: { used: state.brood, available: state.broodCapacity, occupancy: Number(state.broodOccupancy.toFixed(2)) },
+    reserveTarget: Number(state.reserveTarget.toFixed(1)),
+    reserveRatio: Number(state.reserveRatio.toFixed(2)),
+    foodSufficiency: Number(state.foodFactor.toFixed(2)),
+    queenLayingDrive: Number(state.layingDrive.toFixed(2)),
+    queenState: state.queenState,
+    limitingFactor: state.limitingFactor,
+    starvationPressure: Number(state.starvationPressure.toFixed(2)),
+    crowdingPressure: Number(state.crowdingPressure.toFixed(2)),
+    technicalSafetyCeiling: colony.technicalWorkerLimit,
+  };
+}
+
 function registeredColonySummary(colony) {
   const livingWorkers = colony.workers.filter((worker) => worker.alive !== false);
   const reproduction = colony.reproduction;
@@ -6297,11 +7235,12 @@ function registeredColonySummary(colony) {
     speciesProfile: colony.speciesProfile,
     status: colony.status,
     foundedBy: colony.foundedBy,
-    ageYears: Number((colony.ageAtStartYears + Math.max(0, simTime - (colony.foundedAt || 0)) / (92 * SEASONS.length)).toFixed(2)),
+    ageYears: Number((colony.ageAtStartYears + Math.max(0, simTime - (colony.foundedAt || 0)) / ECOLOGICAL_YEAR_SECONDS).toFixed(2)),
     nest: { x: colony.nest.x, z: colony.nest.y },
     queen: { id: colony.queen.id, alive: colony.queen.alive, genome: colony.queen.genome },
     workers: livingWorkers.length,
     capacity: colony.maxWorkers,
+    demographics: demographicSummary(colony),
     brood: {
       total: colony.brood.length,
       eggs: colony.brood.filter((item) => item.stage === 'egg').length,
@@ -6314,6 +7253,7 @@ function registeredColonySummary(colony) {
     reproduction: reproduction ? {
       storedSires: reproduction.spermBank.length,
       reproductiveBudget: Number(reproduction.reproductiveBudget.toFixed(2)),
+      workerEggsLaid: reproduction.workerEggsLaid,
       sexualEggsLaid: reproduction.sexualEggsLaid,
       adultMales: reproduction.alates.filter((alate) => alate.destiny === 'male').length,
       adultGynes: reproduction.alates.filter((alate) => alate.destiny === 'gyne').length,
@@ -6330,6 +7270,7 @@ function registeredColonySummary(colony) {
       surfaceWorkers: colony.workers.filter((worker) => worker.alive && !worker.insideNest).length,
       foodDelivered: colony.queen.foodDelivered || 0,
       workerDeaths: colony.queen.workerDeaths || 0,
+      broodDeaths: colony.queen.foundingBroodDeaths || 0,
       collapseCause: colony.queen.collapseCause || null,
     } : null,
     storedFood: Number(colony.storedFood.toFixed(1)),
@@ -6366,9 +7307,15 @@ function foragingNetworkSummary(network) {
     activeSectors,
     establishedTrunks,
     routeSwitches: network.routeSwitches,
+    congestionReroutes: network.congestionReroutes,
+    staleMemoriesExpired: network.staleMemoriesExpired,
     learningWalksCompleted: network.learningWalksCompleted,
     privateMemorySeconds: Number(network.memoryGuidedSteps.toFixed(1)),
     socialInformationSeconds: Number(network.socialGuidedSteps.toFixed(1)),
+    localSearchSeconds: Number(network.localSearchSteps.toFixed(1)),
+    exploratorySearchSeconds: Number(network.exploratorySteps.toFixed(1)),
+    recentPeakSectorShare: Number(network.peakSectorShare.toFixed(2)),
+    currentPeakSectorShare: Number(network.currentPeakSectorShare.toFixed(2)),
     sectors: network.sectors.map((sector) => {
       const target = sectorTarget(network, sector);
       return {
@@ -6380,6 +7327,11 @@ function foragingNetworkSummary(network) {
         successfulReturns: sector.successes,
         failures: sector.failures,
         activeForagers: sector.activeForagers,
+        availableFood: Math.round(sector.availableFood),
+        resourceSites: sector.resourceSites,
+        recruitmentCapacity: sector.recruitmentCapacity,
+        congestion: Number(sector.congestion.toFixed(2)),
+        stale: sector.stale,
         trunkStrength: Number(sector.trunkStrength.toFixed(2)),
         target: { x: Number(target.x.toFixed(1)), z: Number(target.z.toFixed(1)) },
       };
@@ -6410,12 +7362,21 @@ function colonyArchitectureSummary(architecture) {
     completedNewChambers: architecture.nodes.filter((node) => node.renderChamber && node.completed).length,
     activeGrowthFronts: active ? 1 : 0,
     habitableCapacity: Math.round(architecture.habitableCapacity),
+    broodCapacity: architectureBroodCapacity(architecture),
     storageCapacity: Math.round(architecture.storageCapacity),
+    storagePressure: Number((architecture.storagePressure || 0).toFixed(2)),
+    usefulStoragePressure: Number((architecture.usefulStoragePressure || 0).toFixed(2)),
+    reserveRatio: Number((architecture.reserveRatio || 0).toFixed(2)),
     occupancy: Number(architecture.occupancy.toFixed(2)),
     growthDrive: Number(architecture.growthDrive.toFixed(2)),
     deepestDepth: Number(chamberDepth(architecture).toFixed(2)),
     totalExcavated: Number(architecture.totalExcavated.toFixed(1)),
     spoilDeposits: architecture.spoilDeposits,
+    circulatingWorkers: architecture.circulatingWorkers.length,
+    circulationWorkerIds: architecture.circulatingWorkers.slice(0, 18).map((worker) => workerDisplayId(worker)),
+    circulationSeconds: Number(architecture.circulationSeconds.toFixed(1)),
+    inspectionTrips: architecture.inspectionTrips,
+    visitedChambers: architecture.visitedChamberIds.size,
     activeProject: active ? {
       id: active.id,
       chamberType: architectureNodeById(architecture, active.toNodeId)?.type || 'unknown',
@@ -6434,6 +7395,44 @@ function colonyArchitectureSummary(architecture) {
   };
 }
 
+function surfaceTrafficSummary() {
+  const workers = [];
+  for (const colony of livingColonies()) {
+    for (const worker of colony.workers) if (worker.alive !== false && !worker.insideNest) workers.push(worker);
+  }
+  const colonies = {};
+  for (const colony of livingColonies()) {
+    const surface = workers.filter((worker) => worker.colonyId === colony.id);
+    let densestRadiusCount = 0;
+    let nearestSum = 0;
+    for (const worker of surface) {
+      let local = 0;
+      let nearest = Infinity;
+      for (const other of workers) {
+        if (worker === other) continue;
+        const distance = Math.hypot(worker.x - other.x, worker.z - other.z);
+        if (distance < 1.5) local++;
+        nearest = Math.min(nearest, distance);
+      }
+      densestRadiusCount = Math.max(densestRadiusCount, local);
+      if (Number.isFinite(nearest)) nearestSum += nearest;
+    }
+    colonies[colony.id] = {
+      surfaceWorkers: surface.length,
+      densestNeighborsWithin1_5m: densestRadiusCount,
+      meanNearestNeighborDistance: Number((nearestSum / Math.max(1, surface.length)).toFixed(2)),
+      meanDistanceFromNest: Number((surface.reduce((sum, worker) => sum
+        + Math.hypot(worker.x - colony.nest.x, worker.z - colony.nest.y), 0) / Math.max(1, surface.length)).toFixed(2)),
+    };
+  }
+  let crossColonyContactPairs = 0;
+  for (let i = 0; i < workers.length; i++) for (let j = i + 1; j < workers.length; j++) {
+    if (workers[i].colonyId !== workers[j].colonyId
+      && Math.hypot(workers[i].x - workers[j].x, workers[i].z - workers[j].z) < 0.5) crossColonyContactPairs++;
+  }
+  return { colonies, crossColonyContactPairs };
+}
+
 window.render_game_to_text = () => {
   const carrying = ants.filter((ant) => ant.carrying).length;
   const insideNest = ants.filter((ant) => ant.insideNest).length;
@@ -6444,6 +7443,23 @@ window.render_game_to_text = () => {
     timeScale,
     coordinateSystem: 'origin at scene center; +x right/east, +z toward camera/south, negative y descends into the nest',
     timeSeconds: Number(simTime.toFixed(1)),
+    ecologicalEquilibrium: ecologicalEquilibriumSummary(),
+    adaptiveVisualDetail: {
+      level: adaptiveVisualState.level,
+      animationFrames: adaptiveVisualState.animationFrames,
+      shadowStride: adaptiveVisualState.shadowStride,
+      terrainNormalAlignment: adaptiveVisualState.useTerrainNormals,
+      simulatedSurfaceWorkers: adaptiveVisualState.simulatedSurfaceWorkers,
+      renderedSurfaceWorkers: adaptiveVisualState.renderedSurfaceWorkers,
+      renderedByPopulation: {
+        amber: adaptiveVisualState.renderedHomeWorkers,
+        slate: adaptiveVisualState.renderedRivalWorkers,
+        descendants: adaptiveVisualState.renderedDescendantWorkers,
+      },
+      undergroundRepresentatives: adaptiveVisualState.renderedUndergroundWorkers,
+      undergroundRepresentativeLimit: adaptiveVisualState.undergroundRepresentativeLimit,
+      simulationIndividualsRemovedByDetailSystem: 0,
+    },
     weather: weather.rain > 0.6 ? 'rain' : weather.rain > 0.08 ? 'drizzle' : 'clear',
     rainIntensity: Number(weather.rain.toFixed(2)),
     postRainHumidity: Number(weather.postRainHumidity.toFixed(2)),
@@ -6452,7 +7468,8 @@ window.render_game_to_text = () => {
       focusedColonyId: cameraRig.focusedColonyId,
       activeColonies: livingColonies().length,
       totalWorkers: totalActiveWorkers(),
-      globalWorkerCapacity: MAX_ACTIVE_WORKERS,
+      globalTechnicalSafetyCeiling: TECHNICAL_GLOBAL_WORKER_LIMIT,
+      surfaceTraffic: surfaceTrafficSummary(),
       colonies: colonyOrder.map((id) => registeredColonySummary(getColony(id))),
     },
     colony: {
@@ -6487,10 +7504,9 @@ window.render_game_to_text = () => {
     },
     biology: {
       queen: {
-        state: environment.season.name === 'winter' ? 'winter pause'
-          : environment.pressure === 'disease outbreak' ? 'outbreak pause'
-            : storedFood > 22 ? 'laying' : 'food-limited',
+        state: homeColonyRecord.demographics?.queenState || 'assessing colony conditions',
         eggsLaid: queenEggsLaid,
+        layingDrive: Number((homeColonyRecord.demographics?.layingDrive || 0).toFixed(2)),
       },
       brood: {
         total: brood.length,
@@ -6501,6 +7517,8 @@ window.render_game_to_text = () => {
         males: brood.filter((item) => item.destiny === 'male').length,
         gynes: brood.filter((item) => item.destiny === 'gyne').length,
         starvedLarvae: colonyBiology.starvedLarvae,
+        deaths: colonyBiology.broodDeaths,
+        technicalBlockedEclosions: colonyBiology.technicalBlockedEclosions,
       },
       reproduction: {
         system: 'haplodiploid; males are unfertilized maternal offspring and females use stored sperm',
@@ -6607,13 +7625,18 @@ window.render_game_to_text = () => {
     },
     rivalColony: {
       nest: { x: RIVAL_NEST.x, z: RIVAL_NEST.y },
-      queen: { state: environment.season.name === 'winter' ? 'winter pause' : rivalColony.storedFood > 24 ? 'laying' : 'food-limited', eggsLaid: rivalColony.eggsLaid },
+      queen: {
+        state: rivalColonyRecord.demographics?.queenState || 'assessing colony conditions',
+        eggsLaid: rivalColony.eggsLaid,
+        layingDrive: Number((rivalColonyRecord.demographics?.layingDrive || 0).toFixed(2)),
+      },
       workers: rivalAnts.length,
       roles: {
         foragers: rivalAnts.filter((rival) => rival.role === 'forager').length,
         scouts: rivalAnts.filter((rival) => rival.role === 'scout').length,
         guards: rivalAnts.filter((rival) => rival.role === 'guard').length,
         transfers: rivalAnts.filter((rival) => rival.role === 'transfer').length,
+        interiorReserve: rivalAnts.filter((rival) => rival.role === 'interior').length,
       },
       brood: {
         total: rivalBrood.length,
@@ -6623,6 +7646,8 @@ window.render_game_to_text = () => {
         workers: rivalBrood.filter((item) => item.destiny === 'worker').length,
         males: rivalBrood.filter((item) => item.destiny === 'male').length,
         gynes: rivalBrood.filter((item) => item.destiny === 'gyne').length,
+        deaths: rivalColony.broodDeaths,
+        technicalBlockedEclosions: rivalColony.technicalBlockedEclosions,
       },
       reproduction: {
         system: 'haplodiploid; males are unfertilized maternal offspring and females use stored sperm',
@@ -6665,6 +7690,11 @@ window.render_game_to_text = () => {
       },
       workersEclosed: rivalColony.workersEclosed,
       deaths: rivalColony.deaths,
+      mortality: {
+        starvation: rivalColony.starvationDeaths,
+        age: rivalColony.ageDeaths,
+        crowding: rivalColony.crowdingDeaths,
+      },
       genetics: {
         queen: rivalQueenGenome,
         livingAverage: averageGenome(rivalAnts),
@@ -6762,11 +7792,13 @@ window.render_game_to_text = () => {
             eggs: queen.foundingBrood?.filter((item) => item.stage === 'egg').length || 0,
             larvae: queen.foundingBrood?.filter((item) => item.stage === 'larva').length || 0,
             pupae: queen.foundingBrood?.filter((item) => item.stage === 'pupa').length || 0,
+            deaths: queen.foundingBroodDeaths || 0,
           },
           nanitics: queen.nanitics?.length || 0,
           surfaceWorkers: queen.nanitics?.filter((worker) => worker.alive && !worker.insideNest).length || 0,
           workerDeaths: queen.workerDeaths || 0,
           registeredColonyId: queen.registeredColonyId,
+          demographics: queen.registeredColonyId ? demographicSummary(getColony(queen.registeredColonyId)) : null,
           failureCause: queen.failureCause || null,
           collapseCause: queen.collapseCause || null,
         },
@@ -6816,6 +7848,13 @@ window.render_game_to_text = () => {
         learningWalk: Number(selectedAnt.navigation.learningWalk.toFixed(2)),
         successfulTrips: selectedAnt.navigation.successfulTrips,
         failedSearches: selectedAnt.navigation.failedSearches,
+        emptySectorSeconds: Number(selectedAnt.navigation.emptySectorTime.toFixed(1)),
+        sectorCommitSecondsRemaining: Number(Math.max(0, selectedAnt.navigation.sectorCommitUntil - simTime).toFixed(1)),
+        localSearchTarget: selectedAnt.navigation.localTargetX == null ? null : {
+          x: Number(selectedAnt.navigation.localTargetX.toFixed(1)),
+          z: Number(selectedAnt.navigation.localTargetZ.toFixed(1)),
+        },
+        nestInspectionTrips: selectedAnt.nestExplorationTrips || 0,
         rememberedFood: selectedAnt.navigation.rememberedX == null ? null : {
           x: Number(selectedAnt.navigation.rememberedX.toFixed(1)),
           z: Number(selectedAnt.navigation.rememberedZ.toFixed(1)),
@@ -6834,6 +7873,7 @@ window.render_game_to_text = () => {
       assignedSanitizers: colonyLabor.assignedSanitizers,
       targetExcavators: colonyLabor.targetExcavators,
       assignedExcavators: colonyLabor.assignedExcavators,
+      assignedInteriorReserve: colonyLabor.assignedInterior,
       activelyDigging: ants.filter((ant) => ant.nestMode === 'digging').length,
       haulingSoil: ants.filter((ant) => ant.soilCargo).length,
       spoilDeposits: excavatedSoil,
@@ -6864,6 +7904,12 @@ window.render_game_to_text = () => {
     controls: 'click an ant to select/follow; Esc releases; WASD/arrow keys move; Q/E descend/ascend; drag orbit; B toggles above/below; N switches nest focus; [ and ] change time speed; 0 resets time; right-drag pan; wheel zoom; empty click adds food; shift-click stone; R rain; L ideal nuptial-flight window; P hunting beetle; O web spider; space pause; F fullscreen',
   });
 };
+
+const requestedCalibrationHorizon = clamp(Number(urlParams.get('horizon')) || 0, 0, ECOLOGICAL_YEAR_SECONDS * 4);
+if (requestedCalibrationHorizon > 0) {
+  const horizonSteps = Math.round(requestedCalibrationHorizon / FIXED_DT);
+  for (let step = 0; step < horizonSteps; step++) update(FIXED_DT);
+}
 
 renderAnts();
 updateCamera(0);
