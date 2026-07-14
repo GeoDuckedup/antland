@@ -73,6 +73,62 @@ body {
 }
 
 #ant-note[hidden] { display: none; }
+#census-note {
+  position: absolute;
+  z-index: 4;
+  right: clamp(18px, 3vw, 42px);
+  bottom: clamp(18px, 3vw, 38px);
+  width: min(310px, calc(100vw - 36px));
+  padding: 15px 17px 14px;
+  color: rgba(255, 246, 216, 0.92);
+  background: linear-gradient(145deg, rgba(20, 18, 13, 0.78), rgba(39, 31, 20, 0.63));
+  border: 1px solid rgba(238, 203, 135, 0.22);
+  box-shadow: 0 16px 45px rgba(7, 6, 4, 0.2);
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+}
+#census-note[hidden] { display: none; }
+#ant-note:not([hidden]) + #census-note { display: none; }
+#census-note h2 {
+  margin: 0.28rem 0 0.7rem;
+  font: 400 1.06rem/1.1 Georgia, "Times New Roman", serif;
+}
+#census-timeline {
+  display: flex;
+  align-items: end;
+  gap: 4px;
+  height: 42px;
+  padding-top: 3px;
+  border-bottom: 1px solid rgba(255, 228, 171, 0.2);
+}
+.census-bar {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 5px;
+  max-width: 20px;
+  height: var(--census-height, 20%);
+  background: linear-gradient(180deg, rgba(235, 190, 108, 0.92), rgba(167, 91, 52, 0.7));
+  border-radius: 2px 2px 0 0;
+}
+.census-bar.orphaned { background: linear-gradient(180deg, #d5c5a4, #776b5c); }
+.census-bar.replaced { box-shadow: 0 0 0 1px rgba(157, 201, 137, 0.9); }
+.census-bar::after {
+  content: attr(data-year);
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.46rem;
+  opacity: 0.5;
+}
+#census-summary,
+#census-event {
+  margin: 0.68rem 0 0;
+  font-size: 0.65rem;
+  line-height: 1.35;
+  letter-spacing: 0.025em;
+}
+#census-event { margin-top: 0.25rem; color: #e5bd72; }
 .note-kicker,
 .note-release {
   margin: 0;

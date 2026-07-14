@@ -2,7 +2,7 @@
 
 A browser-based ant-colony observation diorama built with Three.js and generated natural-history sprite artwork.
 
-Two persistent, genetically distinct colonies share the surface ecosystem. Workers inherit mutable speed, size, disease-resistance, aggression, and foraging traits; natural selection changes the living population as generations turn over. Colonies forage from shared food, defend shifting territories, maintain separate queens and brood, survive beetle and web-spider predation, and expose distinct underground nests. Seasonal frost, leaf-fall, vegetation color, food, rain, disease, injury, death, and replacement make colony growth reversible.
+Two genetically distinct colonies begin in a shared surface ecosystem, but neither is permanent. Workers inherit mutable speed, size, disease-resistance, aggression, and foraging traits; natural selection changes the living population as generations turn over. Colonies forage from shared food, defend shifting territories, maintain separate queens and brood, survive beetle and web-spider predation, and expose distinct underground nests. Queens age, colonies reproduce only after maturity, orphaned nests decline, and new lineages can recolonize vacated territories. Seasonal frost, leaf-fall, vegetation color, food, rain, disease, injury, death, and replacement make colony growth reversible.
 
 Run from a local web server:
 

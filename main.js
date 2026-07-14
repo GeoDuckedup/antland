@@ -7,6 +7,11 @@ const antNoteTitle = document.querySelector('#ant-note-title');
 const antNoteTask = document.querySelector('#ant-note-task');
 const antNoteFacts = document.querySelector('#ant-note-facts');
 const speedIndicator = document.querySelector('#speed-indicator');
+const censusNote = document.querySelector('#census-note');
+const censusYear = document.querySelector('#census-year');
+const censusTimeline = document.querySelector('#census-timeline');
+const censusSummary = document.querySelector('#census-summary');
+const censusEvent = document.querySelector('#census-event');
 const WORLD_W = 34;
 const WORLD_D = 26;
 const HALF_W = WORLD_W / 2;
@@ -25,6 +30,12 @@ const SIM_DAYS_PER_SECOND = 365 / ECOLOGICAL_YEAR_SECONDS;
 // still carries a measurable longevity advantage over exterior work.
 const WORKER_SENESCENCE_DAYS = 42;
 const WORKER_SENESCENCE_RATE = 0.0022;
+const COLONY_REPRODUCTIVE_MATURITY_YEARS = 5;
+const QUEEN_LIFESPAN_MIN_YEARS = 20;
+const QUEEN_LIFESPAN_MAX_YEARS = 30;
+const QUEEN_SENESCENCE_YEARS = 3;
+const ORPHAN_TERRITORY_RELEASE_YEARS = 0.75;
+const VACANCY_REPLACEMENT_RADIUS = 3.6;
 // These are deliberately high engine safeguards, not biological population
 // targets. Colony size is regulated below by food, brood space, queen rate,
 // crowding, and mortality.
@@ -62,6 +73,24 @@ function colonyForWorker(worker) {
 
 function livingColonies() {
   return colonyOrder.map((id) => getColony(id)).filter((colony) => colony && colony.status !== 'extinct');
+}
+
+function colonyAgeYears(colony) {
+  if (!colony) return 0;
+  return colony.ageAtStartYears + Math.max(0, simTime - (colony.foundedAt || 0)) / ECOLOGICAL_YEAR_SECONDS;
+}
+
+function territorialColonies() {
+  return livingColonies().filter((colony) => {
+    const territoryState = colony.lifeHistory?.territoryState;
+    return territoryState !== 'vacant' && territoryState !== 'claimed' && territoryState !== 'recolonized';
+  });
+}
+
+function colonyIsReproductivelyMature(colony) {
+  const maturityAge = colony?.lifeHistory?.reproductiveMaturityAgeYears ?? COLONY_REPRODUCTIVE_MATURITY_YEARS;
+  return Boolean(colony && colonyAgeYears(colony) >= maturityAge
+    && colony.lifeHistory?.lifeStage !== 'orphaned' && colony.status !== 'extinct');
 }
 
 function totalActiveWorkers() {
@@ -930,6 +959,7 @@ const forceFlightWhenReady = urlParams.get('flight') === 'force';
 const foundingStressTest = urlParams.get('founding') === 'stress';
 const youngColonyStressTest = urlParams.get('young') === 'collapse';
 const clearWeatherTest = urlParams.get('weather') === 'clear';
+const requestedSuccessionScenario = urlParams.get('succession');
 const requestedNestFocus = urlParams.get('nest');
 cameraRig.focusedColonyId = requestedNestFocus === 'rival' || requestedNestFocus === RIVAL_COLONY_ID
   ? RIVAL_COLONY_ID
@@ -2253,6 +2283,8 @@ rivalNestLight.position.set(8.5, -4.1, -5.0);
 rivalNestScanGroup.add(rivalNestLight);
 
 function updateRivalUndergroundVisuals() {
+  const queenAlive = rivalColonyRecord?.queen?.alive !== false;
+  rivalQueenSprite.visible = queenAlive;
   rivalQueenSprite.material.rotation = 0.24 + Math.sin(simTime * 0.28) * 0.05;
   let visible = 0;
   for (let i = 0; i < rivalBrood.length && visible < rivalBroodPool.length; i++) {
@@ -2605,8 +2637,10 @@ function demographicStateFor(colony, careRatio = 1) {
     : environment.season.name === 'autumn' ? 0.72 : 1;
   const safetyFactor = colony.id === HOME_COLONY_ID && environment.pressure === 'disease outbreak' ? 0.38 : 1;
   const careFactor = clamp(0.34 + careRatio * 0.66, 0.34, 1);
-  const layingDrive = clamp(foodFactor * broodSpaceFactor * workerSpaceFactor
-    * seasonFactor * safetyFactor * careFactor, 0, 1);
+  const queenAlive = colony.queen?.alive !== false;
+  const queenVitality = colony.lifeHistory?.queenVitality ?? 1;
+  const layingDrive = queenAlive ? clamp(foodFactor * broodSpaceFactor * workerSpaceFactor
+    * seasonFactor * safetyFactor * careFactor * queenVitality, 0, 1) : 0;
   const starvationPressure = clamp((0.28 - reserveRatio) / 0.28, 0, 1);
   const crowdingPressure = clamp((occupancy - 1) / 0.34, 0, 1);
   const factors = [
@@ -2617,7 +2651,7 @@ function demographicStateFor(colony, careRatio = 1) {
     ['season', seasonFactor],
   ];
   const weakestFactor = factors.sort((a, b) => a[1] - b[1])[0];
-  const limitingFactor = weakestFactor[1] > 0.96 ? 'none' : weakestFactor[0];
+  const limitingFactor = !queenAlive ? 'queen absent' : weakestFactor[1] > 0.96 ? 'none' : weakestFactor[0];
   return {
     workers: workers.length,
     brood: broodItems.length,
@@ -2634,7 +2668,8 @@ function demographicStateFor(colony, careRatio = 1) {
     starvationPressure,
     crowdingPressure,
     limitingFactor,
-    queenState: environment.season.name === 'winter' ? 'winter pause'
+    queenState: !queenAlive ? 'queen dead · orphaned workforce'
+      : environment.season.name === 'winter' ? 'winter pause'
       : layingDrive >= 0.62 ? 'laying strongly'
         : layingDrive >= 0.18 ? `laying slowly · ${limitingFactor} limited`
           : `laying paused · ${limitingFactor} limited`,
@@ -3019,6 +3054,9 @@ const broodPool = Array.from({ length: 96 }, () => {
 const homeAlateVisualPool = createAlateVisualPool(homeNestScanGroup, 0x84382e);
 
 function updateBiologicalVisuals() {
+  const queenAlive = homeColonyRecord?.queen?.alive !== false;
+  queenSprite.visible = queenAlive;
+  queenHalo.visible = queenAlive;
   queenSprite.material.rotation = Math.sin(simTime * 0.34) * 0.055 - 0.25;
   queenHalo.rotation.z = simTime * 0.08;
   queenHalo.scale.setScalar(0.96 + Math.sin(simTime * 1.2) * 0.035);
@@ -3390,6 +3428,20 @@ const regionalMating = {
   externalMalesJoined: 0,
 };
 const regionalLineageHistory = { nextEventId: 1, events: [] };
+const regionalLifeHistory = {
+  nextVacancyId: 1,
+  nextCensusYear: 0,
+  vacancies: [],
+  censuses: [],
+  events: [],
+  queenDeaths: 0,
+  colonyExtinctions: 0,
+  reproductiveMaturities: 0,
+  lineageReplacements: 0,
+  latestEvent: 'baseline census established',
+  nextUiUpdate: 0,
+};
+const territoryVacancyVisuals = new Map();
 
 function recordLineageEvent(type, queen, details = {}) {
   regionalLineageHistory.events.push({
@@ -3403,6 +3455,338 @@ function recordLineageEvent(type, queen, details = {}) {
     ...details,
   });
   if (regionalLineageHistory.events.length > 96) regionalLineageHistory.events.shift();
+}
+
+function recordColonyLifeEvent(type, colony, details = {}) {
+  recordLineageEvent(type, colony?.queen, {
+    colonyId: colony?.id || null,
+    lineageId: colony?.lineageId || null,
+    ...details,
+  });
+  regionalLifeHistory.latestEvent = details.label || type.replaceAll('-', ' ');
+  regionalLifeHistory.events.push({
+    time: Number(simTime.toFixed(1)),
+    year: Number((simTime / ECOLOGICAL_YEAR_SECONDS).toFixed(2)),
+    type,
+    colonyId: colony?.id || null,
+    lineageId: colony?.lineageId || null,
+    ...details,
+  });
+  if (regionalLifeHistory.events.length > 64) regionalLifeHistory.events.shift();
+  renderRegionalCensus(true);
+}
+
+function deterministicQueenLongevity(colony) {
+  let hash = 2166136261;
+  for (const character of colony.id) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  const normalized = (hash >>> 0) / 4294967295;
+  return QUEEN_LIFESPAN_MIN_YEARS + normalized * (QUEEN_LIFESPAN_MAX_YEARS - QUEEN_LIFESPAN_MIN_YEARS);
+}
+
+function initializeColonyLifeHistory(colony) {
+  if (!colony || colony.lifeHistory) return colony?.lifeHistory || null;
+  let queenLongevityYears = deterministicQueenLongevity(colony);
+  if (requestedSuccessionScenario === 'amber' && colony.id === HOME_COLONY_ID) {
+    queenLongevityYears = colony.ageAtStartYears + 0.45;
+  }
+  const ageYears = colonyAgeYears(colony);
+  const reproductiveMaturityAgeYears = requestedSuccessionScenario === 'maturity'
+    && colony.id !== HOME_COLONY_ID && colony.id !== RIVAL_COLONY_ID
+    ? 0.75 : COLONY_REPRODUCTIVE_MATURITY_YEARS;
+  colony.lifeHistory = {
+    reproductiveMaturityAgeYears,
+    queenLongevityYears,
+    queenAgeYears: ageYears,
+    queenVitality: 1,
+    lifeStage: ageYears >= reproductiveMaturityAgeYears ? 'reproductive prime' : 'pre-reproductive',
+    maturityRecorded: ageYears >= reproductiveMaturityAgeYears,
+    senescenceRecorded: false,
+    queenDiedAt: null,
+    queenDeathAgeYears: null,
+    queenDeathCause: null,
+    orphanedAt: null,
+    workersAtQueenDeath: null,
+    extinctAt: null,
+    territoryState: 'occupied',
+    vacancyId: null,
+    replacementColonyId: null,
+  };
+  return colony.lifeHistory;
+}
+
+function createTerritoryVacancyVisual(vacancy) {
+  const group = new THREE.Group();
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.82, 0.98, 40),
+    new THREE.MeshBasicMaterial({
+      color: vacancy.color,
+      transparent: true,
+      opacity: 0.1,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  group.add(ring);
+  for (let i = 0; i < 4; i++) {
+    const angle = i * Math.PI * 0.5 + 0.38;
+    const marker = new THREE.Mesh(
+      new THREE.ConeGeometry(0.055, 0.34, 5),
+      new THREE.MeshBasicMaterial({ color: vacancy.color, transparent: true, opacity: 0.28 }),
+    );
+    marker.position.set(Math.cos(angle) * 0.9, 0.14, Math.sin(angle) * 0.9);
+    marker.rotation.z = Math.sin(angle) * 0.2;
+    group.add(marker);
+  }
+  group.position.set(vacancy.x, groundHeight(vacancy.x, vacancy.z) + 0.045, vacancy.z);
+  surfaceGroup.add(group);
+  territoryVacancyVisuals.set(vacancy.id, { group, ring, markers: group.children.slice(1) });
+}
+
+function openTerritoryVacancy(colony) {
+  const life = colony.lifeHistory;
+  if (!life || life.vacancyId) return regionalLifeHistory.vacancies.find((vacancy) => vacancy.id === life?.vacancyId) || null;
+  const vacancy = {
+    id: `vacancy-${String(regionalLifeHistory.nextVacancyId++).padStart(3, '0')}`,
+    formerColonyId: colony.id,
+    formerLineageId: colony.lineageId,
+    x: colony.nest.x,
+    z: colony.nest.y,
+    color: colony.color,
+    openedAt: simTime,
+    openedYear: simTime / ECOLOGICAL_YEAR_SECONDS,
+    state: 'contracting',
+    availableAt: null,
+    claimedAt: null,
+    claimantQueenId: null,
+    replacementColonyId: null,
+    replacementLineageId: null,
+  };
+  regionalLifeHistory.vacancies.push(vacancy);
+  life.vacancyId = vacancy.id;
+  createTerritoryVacancyVisual(vacancy);
+  return vacancy;
+}
+
+function availableTerritoryVacancies() {
+  return regionalLifeHistory.vacancies.filter((vacancy) => vacancy.state === 'vacant');
+}
+
+function releaseVacancyClaim(queen) {
+  if (!queen?.settledVacancyId) return;
+  const vacancy = regionalLifeHistory.vacancies.find((item) => item.id === queen.settledVacancyId);
+  if (vacancy?.state === 'claimed' && vacancy.claimantQueenId === queen.id) {
+    vacancy.state = 'vacant';
+    vacancy.claimedAt = null;
+    vacancy.claimantQueenId = null;
+  }
+}
+
+function claimTerritoryVacancy(queen, vacancyId) {
+  const vacancy = regionalLifeHistory.vacancies.find((item) => item.id === vacancyId && item.state === 'vacant');
+  if (!vacancy) return null;
+  vacancy.state = 'claimed';
+  vacancy.claimedAt = simTime;
+  vacancy.claimantQueenId = queen.id;
+  queen.settledVacancyId = vacancy.id;
+  return vacancy;
+}
+
+function completeTerritoryReplacement(queen, colony) {
+  if (!queen?.settledVacancyId) return;
+  const vacancy = regionalLifeHistory.vacancies.find((item) => item.id === queen.settledVacancyId);
+  if (!vacancy || vacancy.claimantQueenId !== queen.id) return;
+  vacancy.state = 'recolonized';
+  vacancy.replacementColonyId = colony.id;
+  vacancy.replacementLineageId = colony.lineageId;
+  colony.lifeHistory.replacedVacancyId = vacancy.id;
+  const former = getColony(vacancy.formerColonyId);
+  if (former?.lifeHistory) former.lifeHistory.replacementColonyId = colony.id;
+  regionalLifeHistory.lineageReplacements++;
+  recordColonyLifeEvent('territory-recolonized', colony, {
+    vacancyId: vacancy.id,
+    formerColonyId: vacancy.formerColonyId,
+    formerLineageId: vacancy.formerLineageId,
+    replacementLineageId: colony.lineageId,
+    label: `${colony.displayName} replaced ${vacancy.formerLineageId}`,
+  });
+}
+
+function killColonyQueen(colony, cause = 'natural senescence') {
+  const life = colony?.lifeHistory;
+  if (!colony || !life || colony.queen?.alive === false) return false;
+  colony.queen.alive = false;
+  if ('queenHealth' in colony.queen) colony.queen.queenHealth = 0;
+  life.lifeStage = 'orphaned';
+  life.queenVitality = 0;
+  life.queenDiedAt = simTime;
+  life.queenDeathAgeYears = colonyAgeYears(colony);
+  life.queenDeathCause = cause;
+  life.orphanedAt = simTime;
+  life.workersAtQueenDeath = colony.workers.filter((worker) => worker.alive !== false).length;
+  life.territoryState = 'contracting';
+  colony.status = 'orphaned';
+  regionalLifeHistory.queenDeaths++;
+  openTerritoryVacancy(colony);
+  recordColonyLifeEvent('queen-died', colony, {
+    cause,
+    ageYears: Number(life.queenDeathAgeYears.toFixed(2)),
+    workers: life.workersAtQueenDeath,
+    label: `${colony.displayName} queen died`,
+  });
+  return true;
+}
+
+function recordRegionalCensus() {
+  const year = Math.floor(simTime / ECOLOGICAL_YEAR_SECONDS);
+  if (year < regionalLifeHistory.nextCensusYear) return;
+  regionalLifeHistory.nextCensusYear = year + 1;
+  const colonies = colonyOrder.map((id) => getColony(id)).filter(Boolean);
+  regionalLifeHistory.censuses.push({
+    year,
+    time: Number(simTime.toFixed(1)),
+    workers: totalActiveWorkers(),
+    activeColonies: livingColonies().length,
+    reproductiveColonies: livingColonies().filter((colony) => colonyIsReproductivelyMature(colony) && colony.queen?.alive !== false).length,
+    orphanedColonies: colonies.filter((colony) => colony.status === 'orphaned').length,
+    extinctColonies: colonies.filter((colony) => colony.status === 'extinct').length,
+    occupiedLineages: livingColonies().map((colony) => colony.lineageId),
+    vacancies: regionalLifeHistory.vacancies.filter((vacancy) => vacancy.state === 'vacant').length,
+    queenDeaths: regionalLifeHistory.queenDeaths,
+    lineageReplacements: regionalLifeHistory.lineageReplacements,
+    births: colonies.reduce((sum, colony) => sum + (colony.workersEclosed || 0), 0),
+    deaths: colonies.reduce((sum, colony) => sum + (colony.deaths || 0), 0),
+  });
+  if (regionalLifeHistory.censuses.length > 32) regionalLifeHistory.censuses.shift();
+  renderRegionalCensus(true);
+}
+
+function renderRegionalCensus(force = false) {
+  if (!censusNote || !censusTimeline) return;
+  if (!force && simTime < regionalLifeHistory.nextUiUpdate) return;
+  regionalLifeHistory.nextUiUpdate = simTime + 2;
+  censusNote.hidden = false;
+  const year = Math.floor(simTime / ECOLOGICAL_YEAR_SECONDS);
+  const colonies = colonyOrder.map((id) => getColony(id)).filter(Boolean);
+  const live = livingColonies();
+  const orphaned = colonies.filter((colony) => colony.status === 'orphaned').length;
+  const vacant = regionalLifeHistory.vacancies.filter((vacancy) => vacancy.state === 'vacant').length;
+  censusYear.textContent = `Ecological year ${year}`;
+  const recent = regionalLifeHistory.censuses.slice(-12);
+  const maxWorkers = Math.max(1, ...recent.map((census) => census.workers));
+  censusTimeline.replaceChildren();
+  recent.forEach((census, index) => {
+    const previous = recent[index - 1];
+    const bar = document.createElement('span');
+    bar.className = 'census-bar';
+    if (previous && census.queenDeaths > previous.queenDeaths) bar.classList.add('orphaned');
+    if (previous && census.lineageReplacements > previous.lineageReplacements) bar.classList.add('replaced');
+    bar.dataset.year = String(census.year);
+    bar.title = `Year ${census.year}: ${census.workers} workers, ${census.activeColonies} colonies`;
+    bar.style.setProperty('--census-height', `${Math.max(8, census.workers / maxWorkers * 100)}%`);
+    censusTimeline.append(bar);
+  });
+  censusSummary.textContent = `${totalActiveWorkers()} workers · ${live.length} active colonies · ${orphaned} orphaned · ${vacant} vacant territories`;
+  censusEvent.textContent = regionalLifeHistory.latestEvent;
+}
+
+function updateTerritoryVacancyVisuals() {
+  for (const vacancy of regionalLifeHistory.vacancies) {
+    const visual = territoryVacancyVisuals.get(vacancy.id);
+    if (!visual) continue;
+    const pulse = 0.92 + Math.sin(simTime * 1.2 + vacancy.openedYear) * 0.08;
+    const stateOpacity = vacancy.state === 'contracting' ? 0.09
+      : vacancy.state === 'vacant' ? 0.26
+        : vacancy.state === 'claimed' ? 0.34 : 0.13;
+    visual.ring.material.opacity = stateOpacity * pulse;
+    visual.ring.material.color.setHex(vacancy.state === 'claimed' ? 0xf0cf7b
+      : vacancy.state === 'recolonized' ? 0x9abe7b : vacancy.color);
+    for (const marker of visual.markers) {
+      marker.material.opacity = stateOpacity * 1.15;
+      marker.material.color.copy(visual.ring.material.color);
+    }
+    visual.group.scale.setScalar(vacancy.state === 'vacant' ? 1.08 : vacancy.state === 'claimed' ? 0.92 : 1);
+  }
+}
+
+function updateColonyLifeHistories() {
+  for (const colony of colonyRegistry.values()) {
+    const life = initializeColonyLifeHistory(colony);
+    const ageYears = colonyAgeYears(colony);
+    life.queenAgeYears = ageYears;
+    if (colony.status === 'extinct') continue;
+
+    if (colony.queen?.alive !== false) {
+      const yearsRemaining = life.queenLongevityYears - ageYears;
+      life.queenVitality = yearsRemaining >= QUEEN_SENESCENCE_YEARS ? 1
+        : clamp(0.32 + yearsRemaining / QUEEN_SENESCENCE_YEARS * 0.68, 0, 1);
+      if (ageYears >= life.reproductiveMaturityAgeYears && !life.maturityRecorded) {
+        life.maturityRecorded = true;
+        life.lifeStage = 'reproductive prime';
+        if (colony.status === 'established') colony.status = 'mature';
+        regionalLifeHistory.reproductiveMaturities++;
+        recordColonyLifeEvent('colony-reproductive-maturity', colony, {
+          ageYears: Number(ageYears.toFixed(2)),
+          workers: colony.workers.filter((worker) => worker.alive !== false).length,
+          label: `${colony.displayName} reached reproductive maturity`,
+        });
+      } else if (ageYears < life.reproductiveMaturityAgeYears) {
+        life.lifeStage = colony.status === 'incipient' ? 'incipient'
+          : colony.status === 'young' ? 'young' : 'pre-reproductive';
+      }
+      if (yearsRemaining <= QUEEN_SENESCENCE_YEARS && !life.senescenceRecorded) {
+        life.senescenceRecorded = true;
+        life.lifeStage = 'queen senescence';
+        recordColonyLifeEvent('queen-senescence-began', colony, {
+          ageYears: Number(ageYears.toFixed(2)),
+          expectedLongevityYears: Number(life.queenLongevityYears.toFixed(2)),
+        });
+      }
+      if (ageYears >= life.queenLongevityYears) killColonyQueen(colony);
+      continue;
+    }
+
+    if (life.lifeStage !== 'orphaned') life.lifeStage = 'orphaned';
+    const livingWorkers = colony.workers.filter((worker) => worker.alive !== false).length;
+    const orphanYears = Math.max(0, simTime - (life.orphanedAt || simTime)) / ECOLOGICAL_YEAR_SECONDS;
+    const vacancy = regionalLifeHistory.vacancies.find((item) => item.id === life.vacancyId);
+    const workforceReleased = livingWorkers <= Math.max(8, Math.round((life.workersAtQueenDeath || 0) * 0.45));
+    if (life.territoryState === 'contracting'
+      && (orphanYears >= ORPHAN_TERRITORY_RELEASE_YEARS || (orphanYears > 0.16 && workforceReleased))) {
+      life.territoryState = 'vacant';
+      if (vacancy) {
+        vacancy.state = 'vacant';
+        vacancy.availableAt = simTime;
+      }
+      recordColonyLifeEvent('territory-vacated', colony, {
+        vacancyId: life.vacancyId,
+        remainingWorkers: livingWorkers,
+        label: `${colony.displayName} territory became vacant`,
+      });
+    }
+    if (livingWorkers === 0 && colony.brood.length === 0 && life.extinctAt == null) {
+      life.extinctAt = simTime;
+      life.lifeStage = 'extinct';
+      life.territoryState = 'vacant';
+      colony.status = 'extinct';
+      if (life.territoryState === 'contracting') life.territoryState = 'vacant';
+      if (vacancy?.state === 'contracting') {
+        vacancy.state = 'vacant';
+        vacancy.availableAt = simTime;
+      }
+      regionalLifeHistory.colonyExtinctions++;
+      recordColonyLifeEvent('colony-extinct', colony, {
+        vacancyId: life.vacancyId,
+        label: `${colony.displayName} became extinct`,
+      });
+    }
+  }
+  recordRegionalCensus();
+  updateTerritoryVacancyVisuals();
+  renderRegionalCensus();
 }
 
 function flightLightLevel() {
@@ -3477,7 +3861,7 @@ function releaseColonyAlates(colonyId, nest, reproduction) {
   let launchedGynes = 0;
   for (let i = reproduction.alates.length - 1; i >= 0 && regionalMating.flyingAlates.length < 66; i--) {
     const alate = reproduction.alates[i];
-    if (alate.ageDays < 0.015) continue;
+    if (alate.ageDays < 7) continue;
     reproduction.alates.splice(i, 1);
     regionalMating.flyingAlates.push(createFlyingAlate(alate, nest, reproduction));
     if (alate.destiny === 'male') { reproduction.malesLaunched++; launchedMales++; }
@@ -3486,8 +3870,19 @@ function releaseColonyAlates(colonyId, nest, reproduction) {
   return { colonyId, males: launchedMales, gynes: launchedGynes };
 }
 
+function reproductiveFlightColonies() {
+  return livingColonies().filter((colony) => {
+    const maturityAge = colony.lifeHistory?.reproductiveMaturityAgeYears ?? COLONY_REPRODUCTIVE_MATURITY_YEARS;
+    const hasCaretakers = colony.workers.some((worker) => worker.alive !== false);
+    return colony.reproduction && colonyAgeYears(colony) >= maturityAge
+      && (colony.queen?.alive !== false || hasCaretakers);
+  });
+}
+
 function availableMatureGynes() {
-  return matureFlightAlates(homeReproduction, 'gyne').length + matureFlightAlates(rivalReproduction, 'gyne').length;
+  return reproductiveFlightColonies().reduce(
+    (sum, colony) => sum + matureFlightAlates(colony.reproduction, 'gyne').length, 0,
+  );
 }
 
 function openNuptialFlight(forced = false) {
@@ -3510,14 +3905,19 @@ function openNuptialFlight(forced = false) {
   regionalMating.windowsOpened++;
   const flightYear = Math.floor(simTime / ECOLOGICAL_YEAR_SECONDS);
   ecologicalBalance.annualFlightWindows.set(flightYear, (ecologicalBalance.annualFlightWindows.get(flightYear) || 0) + 1);
+  const sourceColonies = reproductiveFlightColonies();
+  const centroid = sourceColonies.reduce((point, colony) => point.add(colony.nest), new THREE.Vector2())
+    .multiplyScalar(1 / Math.max(1, sourceColonies.length));
   regionalMating.swarmCenter.set(
-    (NEST.x + RIVAL_NEST.x) * 0.5 + rand(-1.2, 1.2),
+    centroid.x + rand(-1.2, 1.2),
     rand(3.1, 4.1),
-    (NEST.y + RIVAL_NEST.y) * 0.5 + rand(-1, 1),
+    centroid.y + rand(-1, 1),
   );
-  const amberLaunch = releaseColonyAlates(HOME_COLONY_ID, NEST, homeReproduction);
-  const slateLaunch = releaseColonyAlates(RIVAL_COLONY_ID, RIVAL_NEST, rivalReproduction);
-  const totalGynes = amberLaunch.gynes + slateLaunch.gynes;
+  let totalGynes = 0;
+  for (const colony of sourceColonies) {
+    const launch = releaseColonyAlates(colony.id, colony.nest, colony.reproduction);
+    totalGynes += launch.gynes;
+  }
   spawnRegionalMales(clamp(totalGynes * 4 + 4, 7, 22));
   createSignal(regionalMating.swarmCenter.x, regionalMating.swarmCenter.z, 0xe7e0b0);
   return true;
@@ -3526,19 +3926,25 @@ function openNuptialFlight(forced = false) {
 function chooseFoundingSite(natalColonyId) {
   let best = null;
   let bestScore = -Infinity;
+  const vacancies = availableTerritoryVacancies();
   for (let i = 0; i < 28; i++) {
-    const x = rand(-HALF_W + 5.5, HALF_W - 5.5);
-    const z = rand(-HALF_D + 5.5, HALF_D - 5.5);
-    const nestClearance = livingColonies().reduce((min, colony) => Math.min(min, Math.hypot(x - colony.nest.x, z - colony.nest.y)), 20);
+    const vacancy = i < Math.min(12, vacancies.length * 4) ? vacancies[i % vacancies.length] : null;
+    const x = vacancy ? clamp(vacancy.x + rand(-1.15, 1.15), -HALF_W + 3, HALF_W - 3)
+      : rand(-HALF_W + 5.5, HALF_W - 5.5);
+    const z = vacancy ? clamp(vacancy.z + rand(-1.15, 1.15), -HALF_D + 3, HALF_D - 3)
+      : rand(-HALF_D + 5.5, HALF_D - 5.5);
+    const nestClearance = territorialColonies().reduce((min, colony) => Math.min(min, Math.hypot(x - colony.nest.x, z - colony.nest.y)), 20);
     const queenClearance = regionalMating.matedQueens.filter((queen) => queen.alive).reduce(
       (min, queen) => Math.min(min, Math.hypot(x - queen.x, z - queen.z)), 20,
     );
     const obstacleClearance = obstacles.reduce((min, obstacle) => Math.min(min, Math.hypot(x - obstacle.x, z - obstacle.z) - obstacle.r), 8);
     const natalNest = natalColonyId === RIVAL_COLONY_ID ? RIVAL_NEST : NEST;
     const dispersal = Math.hypot(x - natalNest.x, z - natalNest.y);
+    const vacancyDistance = vacancy ? Math.hypot(x - vacancy.x, z - vacancy.z) : Infinity;
+    const vacancyBonus = vacancy ? 15 + clamp((VACANCY_REPLACEMENT_RADIUS - vacancyDistance) * 1.8, 0, 6) : 0;
     const score = Math.min(nestClearance, 8) * 1.3 + Math.min(queenClearance, 6)
-      + Math.min(obstacleClearance, 4) + Math.min(dispersal, 10) * 0.35;
-    if (score > bestScore) { bestScore = score; best = { x, z }; }
+      + Math.min(obstacleClearance, 4) + Math.min(dispersal, 10) * 0.35 + vacancyBonus;
+    if (score > bestScore) { bestScore = score; best = { x, z, vacancyId: vacancy?.id || null }; }
   }
   return best || { x: rand(-12, 12), z: rand(-8, 8) };
 }
@@ -3546,7 +3952,7 @@ function chooseFoundingSite(natalColonyId) {
 function evaluateFoundingSite(x, z) {
   const normal = groundNormal(x, z);
   const slopeQuality = clamp((normal.y - 0.9) / 0.095, 0, 1);
-  const nestClearance = livingColonies().reduce((min, colony) => Math.min(min, Math.hypot(x - colony.nest.x, z - colony.nest.y)), 20);
+  const nestClearance = territorialColonies().reduce((min, colony) => Math.min(min, Math.hypot(x - colony.nest.x, z - colony.nest.y)), 20);
   const nestQuality = clamp((nestClearance - 3.2) / 5.8, 0, 1);
   const obstacleClearance = obstacles.reduce((min, obstacle) => Math.min(min, Math.hypot(x - obstacle.x, z - obstacle.z) - obstacle.r), 6);
   const obstacleQuality = clamp((obstacleClearance - 0.5) / 2.8, 0, 1);
@@ -3636,10 +4042,12 @@ function completeGyneDealation(gyne) {
     nextNaniticId: 1,
     layClock: rand(2.2, 3.4),
     registeredColonyId: null,
+    settledVacancyId: null,
     acceptedAt: null,
     state: 'dealated and assessing a founding refuge',
   };
   queen.reproduction = createFoundressReproduction(queen);
+  if (gyne.landingSite.vacancyId) claimTerritoryVacancy(queen, gyne.landingSite.vacancyId);
   regionalMating.matedQueens.push(queen);
   recordLineageEvent('queen-dealated', queen, { mateCount: queen.mateCount, x: Number(queen.x.toFixed(1)), z: Number(queen.z.toFixed(1)) });
   if (gyne.reproduction) gyne.reproduction.matedGynes++;
@@ -3657,20 +4065,22 @@ function failFoundation(queen, cause) {
   queen.failureCause = cause;
   queen.state = `founding failed · ${cause}`;
   queen.foundingBrood.length = 0;
+  releaseVacancyClaim(queen);
   regionalMating.gynesFailed++;
   recordLineageEvent('foundation-failed', queen, { cause, stage: queen.foundingStage });
 }
 
-function addFoundingEgg(queen, resource = 'reserves') {
+function addFoundingEgg(queen, resource = 'reserves', destiny = 'worker') {
   const available = resource === 'colonyFood' ? queen.colonyFood : queen.reserves;
-  if (queen.foundingBrood.length >= TECHNICAL_BROOD_LIMIT || available < (resource === 'colonyFood' ? 2.4 : 18)) return null;
-  const inherited = createOffspringInheritance(queen.id, queen.genome, queen.reproduction, 'worker');
+  const cost = resource === 'colonyFood' ? reproductiveCost(destiny) : 1.55;
+  if (queen.foundingBrood.length >= TECHNICAL_BROOD_LIMIT || available < (resource === 'colonyFood' ? cost + 1 : 18)) return null;
+  const inherited = createOffspringInheritance(queen.id, queen.genome, queen.reproduction, destiny);
   const item = {
     id: `${queen.id}-brood-${queen.nextBroodId++}`,
     stage: 'egg',
     stageAge: 0,
     sex: inherited.sex,
-    destiny: 'worker',
+    destiny,
     genome: inherited.genome,
     parentage: inherited.parentage,
     generation: queen.generation + 1,
@@ -3679,8 +4089,14 @@ function addFoundingEgg(queen, resource = 'reserves') {
   };
   queen.foundingBrood.push(item);
   queen.eggsLaid++;
-  queen.reproduction.workerEggsLaid++;
-  if (resource === 'colonyFood') queen.colonyFood = Math.max(0, queen.colonyFood - 1.2);
+  if (destiny === 'worker') queen.reproduction.workerEggsLaid++;
+  else {
+    queen.reproduction.sexualEggsLaid++;
+    queen.reproduction.reproductiveBudget = Math.max(0, queen.reproduction.reproductiveBudget - cost);
+    if (destiny === 'male') queen.reproduction.maleInvestment += cost;
+    else queen.reproduction.gyneInvestment += cost;
+  }
+  if (resource === 'colonyFood') queen.colonyFood = Math.max(0, queen.colonyFood - cost);
   else queen.reserves = Math.max(0, queen.reserves - 1.55);
   if (queen.eggsLaid === 1) recordLineageEvent('first-egg-laid', queen, { generation: item.generation });
   return item;
@@ -3785,6 +4201,8 @@ function registerFoundingColony(queen) {
     get workersEclosed() { return queen.workersEclosed; },
     get deaths() { return queen.foundingDeaths; },
   });
+  initializeColonyLifeHistory(record);
+  completeTerritoryReplacement(queen, record);
   queen.foundingStage = 'incipient';
   const architecture = createColonyArchitecture(record, { founding: true, baseCapacity: 0, baseStorageCapacity: 0 });
   queen.architectureId = architecture?.colonyId || null;
@@ -3824,8 +4242,10 @@ function updateFoundingBrood(queen, dt) {
     if (item.stage === 'egg') { item.stage = 'larva'; item.stageAge = 0; }
     else if (item.stage === 'larva') { item.stage = 'pupa'; item.stageAge = 0; }
     else {
-      const worker = createNanitic(queen, item);
-      if (!worker) {
+      const eclosed = item.destiny === 'worker'
+        ? createNanitic(queen, item)
+        : ecloseAlate(queen.reproduction, item, queen.registeredColonyId || `incipient-${queen.id}`, queen.id);
+      if (!eclosed) {
         if (!item.technicalBlockReported) {
           item.technicalBlockReported = true;
           queen.technicalBlockedEclosions = (queen.technicalBlockedEclosions || 0) + 1;
@@ -3834,7 +4254,7 @@ function updateFoundingBrood(queen, dt) {
         continue;
       }
       queen.foundingBrood.splice(i, 1);
-      if (!queen.registeredColonyId) registerFoundingColony(queen);
+      if (item.destiny === 'worker' && !queen.registeredColonyId) registerFoundingColony(queen);
     }
   }
 }
@@ -4025,6 +4445,8 @@ function markYoungWorkerDead(queen, worker, cause) {
 
 function collapseYoungColony(queen, cause) {
   if (queen.foundingStage === 'collapsed') return;
+  const colony = getColony(queen.registeredColonyId);
+  if (colony?.lifeHistory && queen.alive) killColonyQueen(colony, cause);
   queen.alive = false;
   queen.queenHealth = 0;
   queen.collapseCause = cause;
@@ -4033,12 +4455,24 @@ function collapseYoungColony(queen, cause) {
   queen.foundingBrood.length = 0;
   for (const worker of queen.nanitics) markYoungWorkerDead(queen, worker, 'colony collapse');
   queen.nanitics.length = 0;
-  const colony = getColony(queen.registeredColonyId);
-  if (colony) colony.status = 'extinct';
+  if (colony) {
+    colony.status = 'extinct';
+    colony.lifeHistory.lifeStage = 'extinct';
+    if (colony.lifeHistory.extinctAt == null) regionalLifeHistory.colonyExtinctions++;
+    colony.lifeHistory.extinctAt = simTime;
+    colony.lifeHistory.territoryState = 'vacant';
+    const vacancy = regionalLifeHistory.vacancies.find((item) => item.id === colony.lifeHistory.vacancyId);
+    if (vacancy && vacancy.state !== 'recolonized') vacancy.state = 'vacant';
+    recordColonyLifeEvent('colony-extinct', colony, {
+      vacancyId: colony.lifeHistory.vacancyId,
+      cause,
+      label: `${colony.displayName} became extinct`,
+    });
+  }
   recordLineageEvent('colony-collapsed', queen, { cause, workersEclosed: queen.workersEclosed, foodDelivered: queen.foodDelivered });
 }
 
-function updateYoungColony(queen, dt) {
+function updateYoungColony(queen, dt, queenMayLay = true) {
   const colony = getColony(queen.registeredColonyId);
   queen.colonyFood = acceptColonyStoredFood(queen.registeredColonyId, queen.colonyFood);
   queen.colonyFood = consumeColonyStoredFood(
@@ -4071,12 +4505,26 @@ function updateYoungColony(queen, dt) {
   queen.layClock -= dt;
   demographics = demographicStateFor(colony, careRatio);
   if (colony) colony.demographics = demographics;
+  updateAlateCohort(queen.reproduction, dt);
+  const reproductivelyMature = colonyIsReproductivelyMature(colony);
+  if (queenMayLay && reproductivelyMature
+    && (environment.season.name === 'spring' || environment.season.name === 'summer') && queen.colonyFood > 48) {
+    queen.reproduction.reproductiveBudget = clamp(
+      queen.reproduction.reproductiveBudget + dt * 0.016 * clamp((queen.colonyFood - 48) / 50, 0, 1), 0, 18,
+    );
+  }
   if (queen.layClock <= 0) {
-    const canLay = demographics.layingDrive > 0.08
+    const canLay = queenMayLay && demographics.layingDrive > 0.08
       && queen.foundingBrood.length < demographics.broodCapacity
       && queen.foundingBrood.length < TECHNICAL_BROOD_LIMIT;
-    if (canLay && addFoundingEgg(queen, 'colonyFood')) {
-      queen.state = 'laying a food-supported worker cohort';
+    let destiny = 'worker';
+    if (canLay && reproductivelyMature && queen.nanitics.length >= 45 && queen.colonyFood > 58
+      && queen.reproduction.reproductiveBudget >= reproductiveCost('male') && random() < 0.36) {
+      const candidate = chooseSexualDestiny(queen.reproduction);
+      if (queen.reproduction.reproductiveBudget >= reproductiveCost(candidate)) destiny = candidate;
+    }
+    if (canLay && addFoundingEgg(queen, 'colonyFood', destiny)) {
+      queen.state = destiny === 'worker' ? 'laying a food-supported worker cohort' : `investing in a ${destiny} alate`;
     }
     queen.layClock = canLay
       ? rand(5.2, 7.4) / clamp(0.62 + demographics.layingDrive * 0.58, 0.62, 1.2)
@@ -4084,15 +4532,18 @@ function updateYoungColony(queen, dt) {
   }
   updateFoundingBrood(queen, dt);
 
-  if (youngColonyStressTest) queen.queenHealth -= dt * 1.7;
-  else if (queen.nanitics.length === 0 && queen.colonyFood <= 0) queen.queenHealth -= dt * 0.12;
-  else if (queen.colonyFood > 4) queen.queenHealth = Math.min(100, queen.queenHealth + dt * 0.02);
+  if (queenMayLay) {
+    if (youngColonyStressTest) queen.queenHealth -= dt * 1.7;
+    else if (queen.nanitics.length === 0 && queen.colonyFood <= 0) queen.queenHealth -= dt * 0.12;
+    else if (queen.colonyFood > 4) queen.queenHealth = Math.min(100, queen.queenHealth + dt * 0.02);
+  }
 
-  if (queen.queenHealth <= 0 || (queen.nanitics.length === 0 && simTime - queen.openedAt > 24)) {
+  if (queenMayLay && (queen.queenHealth <= 0 || (queen.nanitics.length === 0 && simTime - queen.openedAt > 24))) {
     collapseYoungColony(queen, queen.queenHealth <= 0 ? 'queen starvation' : 'loss of the nanitic workforce');
     return;
   }
-  if (queen.nanitics.length >= 18 && queen.colonyFood > 18 && colony?.status !== 'established') {
+  if (queenMayLay && queen.nanitics.length >= 18 && queen.colonyFood > 18
+    && (colony?.status === 'incipient' || colony?.status === 'young')) {
     if (colony) colony.status = 'established';
     queen.foundingStage = 'established';
     queen.state = 'established young colony with sustained foraging';
@@ -4100,6 +4551,8 @@ function updateYoungColony(queen, dt) {
   } else if (queen.foundingStage === 'young') {
     queen.state = demographics.layingDrive < 0.08
       ? `young colony constrained by ${demographics.limitingFactor}` : 'young colony sustaining queen and brood';
+  } else if (!queenMayLay) {
+    queen.state = 'orphaned workers maintaining the former nest';
   } else if (queen.foundingStage === 'established') {
     queen.state = environment.season.name === 'winter'
       ? 'established colony in winter conservation'
@@ -4110,7 +4563,11 @@ function updateYoungColony(queen, dt) {
 }
 
 function updateFoundingQueen(queen, dt) {
-  if (!queen.alive) return;
+  if (!queen.alive) {
+    const colony = getColony(queen.registeredColonyId);
+    if (colony && colony.status !== 'extinct') updateYoungColony(queen, dt, false);
+    return;
+  }
   queen.stageAge += dt;
   if (!queen.registeredColonyId) {
     const exposure = queen.foundingStage === 'assessing' || queen.foundingStage === 'relocating';
@@ -4133,6 +4590,11 @@ function updateFoundingQueen(queen, dt) {
       queen.siteRejections++;
       recordLineageEvent('founding-site-rejected', queen, { quality: Number(queen.siteQuality.toFixed(2)), rejection: queen.siteRejections });
       queen.relocationTarget = chooseFoundingSite(queen.natalColonyId);
+      if (queen.relocationTarget.vacancyId !== queen.settledVacancyId) {
+        releaseVacancyClaim(queen);
+        queen.settledVacancyId = null;
+        if (queen.relocationTarget.vacancyId) claimTerritoryVacancy(queen, queen.relocationTarget.vacancyId);
+      }
       queen.foundingStage = 'relocating';
       queen.stageAge = 0;
       queen.state = 'rejecting site and searching nearby';
@@ -4264,9 +4726,13 @@ function removeFlyingAlate(index, outcome) {
 
 function updateNuptialFlight(dt) {
   regionalMating.lastSuitability = nuptialFlightSuitability();
+  const matureMales = reproductiveFlightColonies().reduce(
+    (sum, colony) => sum + matureFlightAlates(colony.reproduction, 'male').length, 0,
+  );
   const enoughAlates = availableMatureGynes() > 0
-    && (matureFlightAlates(homeReproduction, 'male').length + matureFlightAlates(rivalReproduction, 'male').length > 0);
-  if (forceFlightWhenReady && regionalMating.windowsOpened === 0 && availableMatureGynes() > 0) openNuptialFlight(true);
+    && matureMales > 0;
+  const successionReady = requestedSuccessionScenario !== 'amber' || availableTerritoryVacancies().length > 0;
+  if (forceFlightWhenReady && regionalMating.windowsOpened === 0 && availableMatureGynes() > 0 && successionReady) openNuptialFlight(true);
   else if (!manualFlightOnly && !forceFlightWhenReady && !regionalMating.flightWindow.active && enoughAlates
     && (ecologicalBalance.annualFlightWindows.get(Math.floor(simTime / ECOLOGICAL_YEAR_SECONDS)) || 0) < 1
     && simTime - regionalMating.lastFlightAt > 60
@@ -5018,6 +5484,8 @@ createColonyArchitecture(rivalColonyRecord, {
   baseStorageCapacity: 88,
   legacyVisuals: true,
 });
+initializeColonyLifeHistory(homeColonyRecord);
+initializeColonyLifeHistory(rivalColonyRecord);
 
 function focusedColony() {
   return getColony(cameraRig.focusedColonyId) || homeColonyRecord;
@@ -5330,7 +5798,8 @@ function updateRivalColony(dt) {
     { baseRate: 0.015, workerRate: 0.001 },
   );
   updateAlateCohort(rivalReproduction, dt);
-  if ((environment.season.name === 'spring' || environment.season.name === 'summer') && rivalColony.storedFood > 62) {
+  if (rivalColonyRecord.queen.alive && colonyIsReproductivelyMature(rivalColonyRecord)
+    && (environment.season.name === 'spring' || environment.season.name === 'summer') && rivalColony.storedFood > 62) {
     rivalReproduction.reproductiveBudget = clamp(
       rivalReproduction.reproductiveBudget + dt * 0.018 * clamp((rivalColony.storedFood - 62) / 55, 0, 1), 0, 18,
     );
@@ -5451,7 +5920,7 @@ function updateRivalColony(dt) {
   demographics = demographicStateFor(rivalColonyRecord, rivalCareRatio);
   rivalColonyRecord.demographics = demographics;
   if (rivalColony.layClock <= 0) {
-    const canLay = demographics.layingDrive > 0.08
+    const canLay = rivalColonyRecord.queen.alive && demographics.layingDrive > 0.08
       && rivalBrood.length < demographics.broodCapacity && rivalBrood.length < TECHNICAL_BROOD_LIMIT;
     if (canLay) {
       const availableBroodSpace = demographics.broodCapacity - rivalBrood.length;
@@ -5460,7 +5929,8 @@ function updateRivalColony(dt) {
       for (let i = 0; i < clutch; i++) {
         const sexualSeason = environment.season.name === 'spring' || environment.season.name === 'summer';
         let destiny = 'worker';
-        if (sexualSeason && rivalAnts.length >= 55 && rivalColony.storedFood > 74
+        if (sexualSeason && colonyIsReproductivelyMature(rivalColonyRecord)
+          && rivalAnts.length >= 55 && rivalColony.storedFood > 74
           && rivalReproduction.reproductiveBudget >= reproductiveCost('male') && random() < 0.38) {
           const candidate = chooseSexualDestiny(rivalReproduction);
           if (rivalReproduction.reproductiveBudget >= reproductiveCost(candidate)) destiny = candidate;
@@ -5518,7 +5988,8 @@ function updateColonyBiology(dt) {
     { baseRate: 0.018, workerRate: 0.0011 },
   );
   updateAlateCohort(homeReproduction, dt);
-  if ((environment.season.name === 'spring' || environment.season.name === 'summer') && storedFood > 65) {
+  if (homeColonyRecord.queen.alive && colonyIsReproductivelyMature(homeColonyRecord)
+    && (environment.season.name === 'spring' || environment.season.name === 'summer') && storedFood > 65) {
     homeReproduction.reproductiveBudget = clamp(
       homeReproduction.reproductiveBudget + dt * 0.02 * clamp((storedFood - 65) / 60, 0, 1), 0, 20,
     );
@@ -5586,7 +6057,7 @@ function updateColonyBiology(dt) {
   homeColonyRecord.demographics = demographics;
   if (queenLayClock <= 0) {
     const safeToLay = environment.pressure === 'stable' || environment.pressure === 'predator alarm';
-    const canLay = safeToLay && demographics.layingDrive > 0.08
+    const canLay = homeColonyRecord.queen.alive && safeToLay && demographics.layingDrive > 0.08
       && brood.length < demographics.broodCapacity && brood.length < TECHNICAL_BROOD_LIMIT;
     if (canLay) {
       const availableBroodSpace = demographics.broodCapacity - brood.length;
@@ -5596,7 +6067,8 @@ function updateColonyBiology(dt) {
       for (let i = 0; i < clutch; i++) {
         const sexualSeason = environment.season.name === 'spring' || environment.season.name === 'summer';
         let destiny = 'worker';
-        if (sexualSeason && ants.length >= 110 && storedFood > 82
+        if (sexualSeason && colonyIsReproductivelyMature(homeColonyRecord)
+          && ants.length >= 110 && storedFood > 82
           && homeReproduction.reproductiveBudget >= reproductiveCost('male') && random() < 0.42) {
           const candidate = chooseSexualDestiny(homeReproduction);
           if (homeReproduction.reproductiveBudget >= reproductiveCost(candidate)) destiny = candidate;
@@ -6881,6 +7353,7 @@ function update(dt) {
     );
   }
   updateSurvival(dt);
+  updateColonyLifeHistories();
   updatePredator(dt);
   updateSpider(dt);
   updateWeather(dt);
@@ -7238,6 +7711,19 @@ function registeredColonySummary(colony) {
     ageYears: Number((colony.ageAtStartYears + Math.max(0, simTime - (colony.foundedAt || 0)) / ECOLOGICAL_YEAR_SECONDS).toFixed(2)),
     nest: { x: colony.nest.x, z: colony.nest.y },
     queen: { id: colony.queen.id, alive: colony.queen.alive, genome: colony.queen.genome },
+    lifeHistory: colony.lifeHistory ? {
+      stage: colony.lifeHistory.lifeStage,
+      queenAgeYears: Number(colony.lifeHistory.queenAgeYears.toFixed(2)),
+      queenLongevityYears: Number(colony.lifeHistory.queenLongevityYears.toFixed(2)),
+      queenVitality: Number(colony.lifeHistory.queenVitality.toFixed(2)),
+      reproductiveMaturityAgeYears: colony.lifeHistory.reproductiveMaturityAgeYears,
+      queenDiedAt: colony.lifeHistory.queenDiedAt,
+      queenDeathCause: colony.lifeHistory.queenDeathCause,
+      territoryState: colony.lifeHistory.territoryState,
+      vacancyId: colony.lifeHistory.vacancyId,
+      replacedVacancyId: colony.lifeHistory.replacedVacancyId || null,
+      replacementColonyId: colony.lifeHistory.replacementColonyId,
+    } : null,
     workers: livingWorkers.length,
     capacity: colony.maxWorkers,
     demographics: demographicSummary(colony),
@@ -7798,12 +8284,35 @@ window.render_game_to_text = () => {
           surfaceWorkers: queen.nanitics?.filter((worker) => worker.alive && !worker.insideNest).length || 0,
           workerDeaths: queen.workerDeaths || 0,
           registeredColonyId: queen.registeredColonyId,
+          settledVacancyId: queen.settledVacancyId,
           demographics: queen.registeredColonyId ? demographicSummary(getColony(queen.registeredColonyId)) : null,
           failureCause: queen.failureCause || null,
           collapseCause: queen.collapseCause || null,
         },
         state: queen.state,
       })),
+    },
+    regionalLifeHistory: {
+      ecologicalYear: Math.floor(simTime / ECOLOGICAL_YEAR_SECONDS),
+      queenDeaths: regionalLifeHistory.queenDeaths,
+      colonyExtinctions: regionalLifeHistory.colonyExtinctions,
+      reproductiveMaturities: regionalLifeHistory.reproductiveMaturities,
+      lineageReplacements: regionalLifeHistory.lineageReplacements,
+      latestEvent: regionalLifeHistory.latestEvent,
+      events: regionalLifeHistory.events.slice(-32),
+      vacancies: regionalLifeHistory.vacancies.map((vacancy) => ({
+        id: vacancy.id,
+        formerColonyId: vacancy.formerColonyId,
+        formerLineageId: vacancy.formerLineageId,
+        state: vacancy.state,
+        openedYear: Number(vacancy.openedYear.toFixed(2)),
+        claimantQueenId: vacancy.claimantQueenId,
+        replacementColonyId: vacancy.replacementColonyId,
+        replacementLineageId: vacancy.replacementLineageId,
+        x: Number(vacancy.x.toFixed(1)),
+        z: Number(vacancy.z.toFixed(1)),
+      })),
+      censuses: regionalLifeHistory.censuses.slice(-12),
     },
     lineageHistory: {
       totalEvents: regionalLineageHistory.events.length,
@@ -7882,7 +8391,7 @@ window.render_game_to_text = () => {
       focus: focusedColony()?.displayName || 'unregistered colony',
       focusedColonyId: cameraRig.focusedColonyId,
       livingArchitecture: colonyArchitectureSummary(focusedColony()?.architecture),
-      rivalArchitecture: { tunnels: rivalNestCurves.length, broodVisible: rivalBrood.length, alatesVisible: rivalReproduction.alates.length, queenVisible: true },
+      rivalArchitecture: { tunnels: rivalNestCurves.length, broodVisible: rivalBrood.length, alatesVisible: rivalReproduction.alates.length, queenVisible: rivalColonyRecord.queen.alive },
       visibleGranarySeeds: {
         amber: homeGranaryVisual.count,
         slate: rivalGranaryVisual.count,
