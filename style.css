@@ -129,6 +129,25 @@ body {
   letter-spacing: 0.025em;
 }
 #census-event { margin-top: 0.25rem; color: #e5bd72; }
+#debug-note {
+  position: absolute;
+  z-index: 6;
+  top: clamp(54px, 7vw, 82px);
+  right: clamp(18px, 3vw, 42px);
+  width: min(390px, calc(100vw - 36px));
+  margin: 0;
+  padding: 13px 15px;
+  color: rgba(218, 237, 214, 0.92);
+  background: rgba(8, 13, 10, 0.82);
+  border: 1px solid rgba(157, 201, 137, 0.3);
+  box-shadow: 0 14px 38px rgba(5, 7, 5, 0.24);
+  font: 500 0.64rem/1.47 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.015em;
+  white-space: pre-wrap;
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+}
+#debug-note[hidden] { display: none; }
 .note-kicker,
 .note-release {
   margin: 0;

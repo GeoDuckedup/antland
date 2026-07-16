@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "592cc6f775cfd1dde6a8db7ee2f3ed9a77219ec7",
+  "seed": "0x0A17C010",
+  "mainFile": {
+    "path": "main.js",
+    "lines": 8425,
+    "bytes": 374282,
+    "topLevelFunctions": 233,
+    "topLevelConst": 268,
+    "topLevelLet": 24
+  },
+  "scenarios": [
+    {
+      "id": "normal",
+      "query": "horizon=368",
+      "targetSimulationSeconds": 368,
+      "file": "normal-year.json"
+    },
+    {
+      "id": "abundance",
+      "query": "demography=abundance&horizon=736",
+      "targetSimulationSeconds": 736,
+      "file": "abundance-two-years.json"
+    },
+    {
+      "id": "scarcity",
+      "query": "demography=scarcity&horizon=736",
+      "targetSimulationSeconds": 736,
+      "file": "scarcity-two-years.json"
+    },
+    {
+      "id": "succession",
+      "query": "demography=abundance&flight=force&horizon=736&succession=amber",
+      "targetSimulationSeconds": 736,
+      "file": "succession-two-years.json"
+    },
+    {
+      "id": "maturity",
+      "query": "demography=abundance&flight=force&horizon=1104&succession=maturity",
+      "targetSimulationSeconds": 1104,
+      "file": "maturity-three-years.json"
+    },
+    {
+      "id": "founding-stress",
+      "query": "flight=force&founding=stress&horizon=92",
+      "targetSimulationSeconds": 92,
+      "file": "founding-stress.json"
+    },
+    {
+      "id": "young-collapse",
+      "query": "flight=force&horizon=230&young=collapse",
+      "targetSimulationSeconds": 230,
+      "file": "young-collapse.json"
+    },
+    {
+      "id": "mature-nest",
+      "query": "horizon=368&nest=rival",
+      "targetSimulationSeconds": 368,
+      "file": "focused-mature-nest.json"
+    },
+    {
+      "id": "descendant-nest",
+      "query": "demography=abundance&flight=force&horizon=184&nest=young",
+      "targetSimulationSeconds": 184,
+      "file": "focused-descendant-nest.json"
+    }
+  ]
+}
