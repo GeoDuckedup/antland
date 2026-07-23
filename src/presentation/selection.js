@@ -63,8 +63,8 @@ export function createSelectionPresentation({
     youngWorkerInstanceLookup,
     undergroundSpritePool,
     rivalTransferPool,
-    ants,
-    rivalAnts,
+    undergroundWorkerSprites = [],
+    resolveWorker,
   }) {
     setPointer(clientX, clientY);
     if (viewState.undergroundBlend < 0.5) {
@@ -87,14 +87,13 @@ export function createSelectionPresentation({
         }
       }
     } else {
-      const hit = raycaster.intersectObjects([...undergroundSpritePool, ...rivalTransferPool], false)
+      const hit = raycaster.intersectObjects([
+        ...undergroundSpritePool,
+        ...rivalTransferPool,
+        ...undergroundWorkerSprites,
+      ], false)
         .find((candidate) => candidate.object.visible);
-      if (hit?.object.userData.antId != null) {
-        return ants.find((ant) => ant.id === hit.object.userData.antId) || null;
-      }
-      if (hit?.object.userData.workerId != null) {
-        return rivalAnts.find((rival) => rival.id === hit.object.userData.workerId) || null;
-      }
+      if (hit?.object.userData.workerUid) return resolveWorker?.(hit.object.userData.workerUid) || null;
     }
     return null;
   }

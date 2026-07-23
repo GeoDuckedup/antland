@@ -3,7 +3,7 @@
 **Audience:** coding AI and project owner
 **Baseline reviewed:** `main` at commit [`592cc6f`](https://github.com/GeoDuckedup/antland/commit/592cc6f775cfd1dde6a8db7ee2f3ed9a77219ec7), 2026-07-14
 **Live build reviewed:** [Formicarium — A Living Study](https://geoduckedup.github.io/antland/)
-**Status:** execution-ready roadmap; Phase 9 is the next phase
+**Status:** execution in progress; Phases 9A–9E complete, Phase 9F next
 
 ---
 
@@ -289,6 +289,8 @@ Every extraction must be behavior-preserving. Avoid moving and redesigning the s
 
 ### 9C — Separate the nest graph from the nest presenter
 
+**Implemented 2026-07-15.** Amber's legacy scan, Slate's legacy scan, and every shared descendant/mature expansion now use pure Map-backed graph records. Three.js curve, tube, chamber, and digging-front resources live in a revision-aware presenter with an explicit release path.
+
 Create pure records:
 
 ```js
@@ -340,6 +342,20 @@ Legacy adapters may exist during migration, but there must be a removal checklis
 - Descendant workers can be selected above and below ground through the same lookup.
 - Amber/Slate visual identity remains parameterized, not hard-coded into behavior.
 
+**Implementation result**
+
+- All registered colonies now enter one canonical `updateWorker(world, colony, worker, dt)` runtime. Identity, age, location, position mirrors, cargo synchronization, mortality, removal, foreign-contact lookup, and render lookup are shared.
+- Amber, Slate, and descendant decision policies are selected by `colony.workerRuntimePolicy`; visual palettes remain separate `colony.workerPresentation` data and cannot select behavior.
+- Surface instances and every underground worker sprite resolve through the same runtime UID index. Underground architecture representatives are restricted to workers whose canonical location is actually underground.
+
+**Temporary policy-adapter removal checklist**
+
+- [x] Remove the former `updateAnt`, `updateRivalAnt`, and `updateYoungWorker` entry points and direct call sites.
+- [x] Isolate the remaining `updateAmberWorkerPolicy`, `updateSlateWorkerPolicy`, and `updateDescendantWorkerPolicy` callbacks behind the single canonical runtime.
+- [ ] Move those decision-policy bodies from `simulation-app.js` into DOM-free role/profile modules after Phase 9E establishes the final shared scheduling and spatial-query contracts.
+- [ ] Replace any colony-specific navigation or delivery branch still embedded in those policy bodies with shared world operations when parity can be checked at the new schedule boundary.
+- [ ] Delete the adapter callbacks after the full Phase 9A fixture matrix passes against the extracted role/profile modules; do not keep a second worker engine as fallback.
+
 ### 9E — Fix update scheduling and spatial costs
 
 **Work**
@@ -360,6 +376,16 @@ Legacy adapters may exist during migration, but there must be a removal checklis
 - Surface-index rebuild count is visible in debug mode and does not exceed the documented schedule.
 - Normal-speed deterministic outcomes remain within the predeclared parity tolerance.
 - Four-year horizon runs do not show unbounded memory growth.
+
+**Implementation result (2026-07-16)**
+
+- A birth/death-maintained worker census now supplies regional totals and technical-cap checks without repeatedly reducing every colony array. Registration is idempotent and exact across eclosion, mortality, removal, and colony creation.
+- The canonical surface-worker index now performs exactly two full builds per fixed step: one before surface movement and one before final symmetric spacing/contact resolution. Bounded worker refreshes preserve the former between-group visibility boundaries without rebuilding the whole index.
+- Deterministic spatial hashes now serve food, remains, local opponent, predator, spider, and sanitation queries. Slate workers no longer scan the full Amber array for routine opponent selection; their rare entrance-delivery qualification retains its sequential same-colony scan because the movement index is intentionally stale until final resolution.
+- Low-frequency UI summaries run at 4 Hz. Nest biology continues at the fixed step, architecture pressure reuses revision-aware capacity data, and presentation work is limited to the focused or transitioning underground colony while every nest graph continues simulating.
+- The animation loop now caps catch-up work at 16 fixed steps per frame, retains at most four deferred steps, drops older excess, and reports deferred and dropped backlog. Direct deterministic horizon stepping remains unbounded by the display guard.
+- Debug diagnostics report full index builds and local refreshes separately. The final normal run recorded 23,604 builds across 11,802 fixed steps (exactly 2.0 builds/step), fixed-step p50 0.8 ms and p95 1.1 ms, spatial p95 0.1 ms, and zero deferred or dropped steps.
+- All nine Phase 9A fixtures pass with zero deterministic differences. A four-year run ended with 210 workers across seven active colonies, bounded event/checkpoint histories, bounded transient counts, and nest graphs below their 50-node safety limit.
 
 ### 9F — Rendering and resource cleanup
 

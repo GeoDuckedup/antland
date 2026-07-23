@@ -20,6 +20,10 @@ export function createDebugOverlay(element, { enabled = false, refreshMs = 250 }
       const timing = profile.timings || {};
       const renderer = state.renderer || {};
       const transients = state.transients || {};
+      const backlogGuard = state.backlogGuard || {};
+      const fixedSteps = profile.frameCounters.fixedSteps || 0;
+      const spatialBuilds = profile.frameCounters.surfaceIndexBuilds || 0;
+      const buildsPerStep = fixedSteps > 0 ? spatialBuilds / fixedSteps : 0;
       element.textContent = [
         'PHASE 9 · DIAGNOSTICS',
         'p50 / p95',
@@ -31,8 +35,9 @@ export function createDebugOverlay(element, { enabled = false, refreshMs = 250 }
         timingLine('nest present', timing.architecturePresentation),
         timingLine('snapshot', timing.snapshot),
         '',
-        `backlog       ${Number(state.backlogMs || 0).toFixed(2)} ms · ${profile.frameCounters.fixedSteps || 0} steps`,
-        `spatial builds ${profile.frameCounters.surfaceIndexBuilds || 0}/frame · ${profile.counters.surfaceIndexBuilds || 0} total`,
+        `backlog       ${Number(state.backlogMs || 0).toFixed(2)} ms · ${fixedSteps} steps`,
+        `catch-up      ${backlogGuard.deferredSteps || 0} deferred · ${Number(backlogGuard.droppedMs || 0).toFixed(1)} ms dropped`,
+        `spatial builds ${spatialBuilds}/frame · ${buildsPerStep.toFixed(1)}/step · ${profile.counters.surfaceIndexBuilds || 0} total`,
         `surface ants   ${state.simulatedSurface}/${state.renderedSurface} simulated/rendered`,
         `below-ground   ${state.simulatedUnderground}/${state.renderedUnderground} simulated/rendered`,
         `colonies       ${state.livingColonies} · LOD ${state.visualMode}`,

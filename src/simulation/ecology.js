@@ -1,4 +1,5 @@
 import { HOME_COLONY_ID, RIVAL_COLONY_ID } from '../config/simulation.js';
+import { nestNodes } from './nest-graph.js';
 
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 
@@ -65,7 +66,7 @@ export function calculateSeedCohortStep(cohort, dt, seasonName, moisture) {
 
 export function architectureBroodCapacity(architecture) {
   if (!architecture) return 12;
-  const excavatedNurserySpace = architecture.nodes
+  const excavatedNurserySpace = nestNodes(architecture)
     .filter((node) => node.completed && (node.type === 'nursery' || node.type === 'founding'))
     .reduce((sum, node) => sum + Math.max(4, Math.round(node.capacity * 0.72)), 0);
   return Math.max(8, architecture.baseBroodCapacity + excavatedNurserySpace);
@@ -74,7 +75,7 @@ export function architectureBroodCapacity(architecture) {
 export function architectureWorkerCapacity(architecture) {
   if (!architecture) return 24;
   return Math.max(8, architecture.baseCapacity
-    + architecture.nodes.filter((node) => node.completed).reduce((sum, node) => sum + node.capacity, 0));
+    + nestNodes(architecture).filter((node) => node.completed).reduce((sum, node) => sum + node.capacity, 0));
 }
 
 export function foodStorageCapacity(colony) {
@@ -113,24 +114,28 @@ export function calculateStoredFoodConsumption({
   return { next: Math.max(0, next), metabolized, spoiled };
 }
 
-export function calculateArchitecturePressure(architecture, colony) {
-  const workers = colony.workers.filter((worker) => worker.alive !== false);
+export function calculateArchitecturePressure(architecture, colony, options = {}) {
+  const workers = options.workers
+    ?? (options.livingWorkerCount == null ? colony.workers.filter((worker) => worker.alive !== false) : []);
+  const workerCount = options.livingWorkerCount ?? workers.length;
   const brood = colony.brood || [];
-  const habitableCapacity = architecture.baseCapacity
-    + architecture.nodes.filter((node) => node.completed).reduce((sum, node) => sum + node.capacity, 0);
-  const storageCapacity = architecture.baseStorageCapacity
-    + architecture.nodes.filter((node) => node.completed).reduce((sum, node) => sum + node.storageCapacity, 0);
-  const load = workers.length + brood.length * 0.58;
+  const nodes = nestNodes(architecture);
+  const habitableCapacity = options.habitableCapacity ?? architecture.baseCapacity
+    + nodes.filter((node) => node.completed).reduce((sum, node) => sum + node.capacity, 0);
+  const storageCapacity = options.storageCapacity ?? architecture.baseStorageCapacity
+    + nodes.filter((node) => node.completed).reduce((sum, node) => sum + node.storageCapacity, 0);
+  const load = workerCount + brood.length * 0.58;
   const occupancy = load / Math.max(1, habitableCapacity);
   const storagePressure = colony.storedFood / Math.max(1, storageCapacity);
-  const larvae = brood.filter((item) => item.stage === 'larva').length;
-  const reserveTarget = 8 + workers.length * 0.14 + brood.length * 0.24 + larvae * 1.55;
+  const larvae = options.larvaeCount ?? brood.filter((item) => item.stage === 'larva').length;
+  const reserveTarget = 8 + workerCount * 0.14 + brood.length * 0.24 + larvae * 1.55;
   const reserveRatio = colony.storedFood / Math.max(1, reserveTarget);
   const usefulStoragePressure = storagePressure * clamp((6.2 - reserveRatio) / 3.2, 0, 1);
-  const broodPressure = brood.length / Math.max(1, workers.length * 0.18);
+  const broodPressure = brood.length / Math.max(1, workerCount * 0.18);
   const growthDrive = Math.max(occupancy, usefulStoragePressure * 0.76, broodPressure * 0.68);
   return {
     workers,
+    workerCount,
     brood,
     habitableCapacity,
     storageCapacity,

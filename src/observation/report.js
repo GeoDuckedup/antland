@@ -6,6 +6,7 @@ import {
   SPECIES_PROFILE,
   TECHNICAL_GLOBAL_WORKER_LIMIT,
 } from '../config/simulation.js';
+import { nestEdges, nestNodes } from '../simulation/nest-graph.js';
 
 function summarizeDemographics(colony, demographicStateFor) {
   const state = colony.demographics || demographicStateFor(colony);
@@ -88,13 +89,15 @@ function summarizeArchitecture(architecture, {
   workerDisplayId,
 }) {
   if (!architecture) return null;
-  const active = architecture.edges.find((edge) => !edge.completed) || null;
+  const nodes = nestNodes(architecture);
+  const edges = nestEdges(architecture);
+  const active = edges.find((edge) => !edge.completed) || null;
   return {
     system: 'shared pressure-driven nest graph',
     baseChambers: architecture.baseChambers,
-    nodeCount: architecture.nodes.length,
-    edgeCount: architecture.edges.length,
-    completedNewChambers: architecture.nodes.filter((node) => node.renderChamber && node.completed).length,
+    nodeCount: nodes.length,
+    edgeCount: edges.length,
+    completedNewChambers: nodes.filter((node) => node.renderChamber && node.completed).length,
     activeGrowthFronts: active ? 1 : 0,
     habitableCapacity: Math.round(architecture.habitableCapacity),
     broodCapacity: architectureBroodCapacity(architecture),
@@ -116,9 +119,9 @@ function summarizeArchitecture(architecture, {
       id: active.id,
       chamberType: architectureNodeById(architecture, active.toNodeId)?.type || 'unknown',
       progress: Number(active.progress.toFixed(2)),
-      workerIds: active.activeDiggers.map((worker) => workerDisplayId(worker)),
+      workerIds: active.activeDiggers?.map((worker) => workerDisplayId(worker)) || active.activeDiggerIds || [],
     } : null,
-    chambers: architecture.nodes.filter((node) => node.renderChamber).map((node) => ({
+    chambers: nodes.filter((node) => node.renderChamber).map((node) => ({
       id: node.id,
       type: node.type,
       completed: node.completed,

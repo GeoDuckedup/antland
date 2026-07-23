@@ -52,6 +52,9 @@ import {
   WORLD_W,
 } from '../config/simulation.js';
 import { createDeterministicRandom } from '../simulation/random.js';
+import { createIntervalScheduler, drainFixedStepBacklog } from '../simulation/scheduler.js';
+import { createSpatialHash } from '../simulation/spatial-hash.js';
+import { createWorkerCensus } from '../simulation/worker-census.js';
 import {
   averageGenome,
   broodStageDuration,
@@ -89,6 +92,24 @@ import { createRendererRuntime } from '../presentation/renderer.js';
 import { createWorldAssets, createWingTexture } from '../presentation/assets.js';
 import { createAntPresentation } from '../presentation/ants.js';
 import { createSelectionPresentation } from '../presentation/selection.js';
+import { createNestPresenter } from '../presentation/nests.js';
+import {
+  addNestEdge,
+  addNestNode,
+  createNestGraph,
+  markNestGraphChanged,
+  nestEdges,
+  nestNodes,
+  updateNestEdgeProgress,
+} from '../simulation/nest-graph.js';
+import {
+  clearWorkerFoodCargo,
+  createWorkerLookup,
+  createWorkerRuntime,
+  ensureCanonicalWorkerRecord,
+  loadWorkerFoodCargo,
+  workerRuntimeUid,
+} from '../simulation/workers.js';
 
 export function startAntlandSimulation() {
 // ---------- constants and deterministic helpers ----------
@@ -110,11 +131,15 @@ let followingSelected = false;
 // getters while later subphases migrate them behind the shared record.
 const colonyRegistry = new Map();
 const colonyOrder = [];
+const workerLookup = createWorkerLookup({ displayIdFor: (worker) => workerDisplayId(worker) });
+const workerCensus = createWorkerCensus();
+const surfaceWorkersNeedingRefresh = new Set();
 
 function registerColony(record) {
   if (!record?.id || colonyRegistry.has(record.id)) throw new Error(`Invalid or duplicate colony id: ${record?.id}`);
   colonyRegistry.set(record.id, record);
   colonyOrder.push(record.id);
+  workerCensus.registerColony(record);
   return record;
 }
 
@@ -146,20 +171,36 @@ function colonyIsReproductivelyMature(colony) {
 }
 
 function totalActiveWorkers() {
-  let total = 0;
-  for (const colony of colonyRegistry.values()) {
-    total += colony.workers.reduce((count, worker) => count + Number(worker.alive !== false), 0);
-  }
-  return total;
+  return workerCensus.totalLiving;
 }
 
 function hasTechnicalWorkerRoom(colonyId, currentWorkers) {
-  return hasTechnicalWorkerCapacity(colonyId, currentWorkers, totalActiveWorkers());
+  const registered = workerCensus.hasColony(colonyId);
+  const colonyWorkers = registered ? workerCensus.colonyCount(colonyId) : currentWorkers;
+  const regionalWorkers = workerCensus.totalLiving + (registered ? 0 : currentWorkers);
+  return hasTechnicalWorkerCapacity(colonyId, colonyWorkers, regionalWorkers);
 }
 
 function workerDisplayId(worker) {
   const colony = colonyForWorker(worker);
   return `${colony?.workerPrefix || 'W'}${String(worker?.id ?? 0).padStart(3, '0')}`;
+}
+
+function indexWorker(worker, colony = colonyForWorker(worker)) {
+  const indexed = workerLookup.index(worker, colony);
+  if (indexed) workerCensus.registerWorker(worker, colony);
+  return indexed;
+}
+
+function removeWorkerIndex(worker, colony = colonyForWorker(worker)) {
+  return workerLookup.remove(worker, colony);
+}
+
+function rebuildWorkerIndex() {
+  workerLookup.clear();
+  for (const colony of colonyRegistry.values()) {
+    for (const worker of colony.workers) indexWorker(worker, colony);
+  }
 }
 
 const { random, rand } = createDeterministicRandom(SIMULATION_SEED);
@@ -812,6 +853,7 @@ function updatePheromones(dt) {
 }
 
 const foods = [];
+const foodSpatialIndex = createSpatialHash({ cellSize: 1.5 });
 const signals = [];
 let simTime = 0;
 let delivered = 0;
@@ -828,6 +870,7 @@ const ecologicalBalance = {
   storedFoodMetabolized: new Map(),
   annualFlightWindows: new Map(),
 };
+const lowFrequencySchedule = createIntervalScheduler();
 const requestedSeasonOffset = clamp(Number(urlParams.get('season')) || 0, 0, SEASONS.length - 1);
 const predatorsDisabled = urlParams.get('predator') === '0';
 const manualFlightOnly = urlParams.get('flight') === 'manual';
@@ -856,6 +899,7 @@ function addFood(x, z, kind = 'crumb', amount = 52, size = 1.5, ecology = {}) {
     sourceColonyId: ecology.sourceColonyId || null,
   };
   foods.push(food);
+  foodSpatialIndex.add(food);
   createSignal(x, z, kind === 'beetle' ? 0xb77c4c : 0xf4d278);
   return food;
 }
@@ -1211,6 +1255,7 @@ function retireDepletedFoodRecords() {
     const food = foods[i];
     if (food.amount > 0 || food.depletedAt == null || simTime - food.depletedAt < 54) continue;
     food.mesh.parent?.remove(food.mesh);
+    foodSpatialIndex.remove(food);
     foods.splice(i, 1);
     ecologicalBalance.depletedFoodRetired++;
   }
@@ -1358,99 +1403,70 @@ const selectionPresentation = createSelectionPresentation({
 });
 
 // ---------- living underground nest scan ----------
-const homeNestScanGroup = new THREE.Group();
-homeNestScanGroup.name = 'amber-nest-scan';
-undergroundGroup.add(homeNestScanGroup);
-const tunnelSegments = [];
-const tunnelFillMaterial = new THREE.MeshBasicMaterial({
+const homeNestGraph = createNestGraph({ colonyId: `${HOME_COLONY_ID}-legacy` });
+const homeNestPresenter = createNestPresenter({
+  parent: undergroundGroup,
+  name: 'amber-nest-scan',
   color: 0x8f512f,
-  transparent: true,
-  opacity: 0.07,
-  side: THREE.DoubleSide,
-  depthWrite: false,
-  fog: false,
+  wireColor: 0xd38b45,
+  chamberColor: 0x75402a,
+  chamberWireColor: 0xe0a45f,
+  fillOpacity: 0.07,
+  wireOpacity: 0.24,
+  chamberFillOpacity: 0.08,
+  chamberWireOpacity: 0.3,
+  tubeSegments: 78,
+  radialSegments: 10,
+  chamberSegments: 22,
+  chamberRings: 14,
+  chamberRevealStart: 0.78,
+  createFront: true,
+  createFrontFace: true,
+  frontColor: 0x9b5e36,
+  frontOpacity: 0.58,
+  frontScaleFactor: 0.72,
+  frontOffset: 0.018,
 });
-const tunnelWireMaterial = new THREE.MeshBasicMaterial({
-  color: 0xd38b45,
-  wireframe: true,
-  transparent: true,
-  opacity: 0.24,
-  side: THREE.DoubleSide,
-  depthWrite: false,
-  fog: false,
-});
-const chamberFillMaterial = new THREE.MeshBasicMaterial({
-  color: 0x75402a,
-  transparent: true,
-  opacity: 0.08,
-  side: THREE.DoubleSide,
-  depthWrite: false,
-  fog: false,
-});
-const chamberWireMaterial = new THREE.MeshBasicMaterial({
-  color: 0xe0a45f,
-  wireframe: true,
-  transparent: true,
-  opacity: 0.3,
-  side: THREE.DoubleSide,
-  depthWrite: false,
-  fog: false,
-});
+const homeNestScanGroup = homeNestPresenter.group;
+const tunnelSegments = [];
 
-function addTunnelSegment(name, points, radius, start, duration, chamberScale) {
-  const curve = new THREE.CatmullRomCurve3(points, false, 'catmullrom', 0.38);
-  const geometry = new THREE.TubeGeometry(curve, 78, radius, 10, false);
-  geometry.setDrawRange(0, 0);
-  const tunnel = new THREE.Group();
-  tunnel.name = name;
-  const fill = new THREE.Mesh(geometry, tunnelFillMaterial);
-  const wire = new THREE.Mesh(geometry, tunnelWireMaterial);
-  fill.renderOrder = 2;
-  wire.renderOrder = 3;
-  tunnel.add(fill, wire);
-  homeNestScanGroup.add(tunnel);
-
-  const chamber = new THREE.Group();
-  const chamberGeometry = new THREE.SphereGeometry(1, 22, 14);
-  chamber.add(
-    new THREE.Mesh(chamberGeometry, chamberFillMaterial),
-    new THREE.Mesh(chamberGeometry, chamberWireMaterial),
-  );
-  chamber.position.copy(points[points.length - 1]);
-  chamber.scale.setScalar(0.001);
-  chamber.visible = false;
-  homeNestScanGroup.add(chamber);
-
-  const tip = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(radius * 0.72, 1),
-    new THREE.MeshBasicMaterial({ color: 0x9b5e36, transparent: true, opacity: 0.58, fog: false }),
-  );
-  tip.visible = false;
-  homeNestScanGroup.add(tip);
-
-  const face = new THREE.Group();
-  const faceDisk = new THREE.Mesh(
-    new THREE.CircleGeometry(radius * 0.94, 15),
-    new THREE.MeshBasicMaterial({ color: 0x351c15, transparent: true, opacity: 0.92, side: THREE.DoubleSide, fog: false }),
-  );
-  const faceRim = new THREE.Mesh(
-    new THREE.RingGeometry(radius * 0.84, radius * 1.12, 15),
-    new THREE.MeshBasicMaterial({ color: 0xb66d3b, transparent: true, opacity: 0.7, side: THREE.DoubleSide, fog: false }),
-  );
-  face.add(faceDisk, faceRim);
-  face.visible = false;
-  face.renderOrder = 5;
-  homeNestScanGroup.add(face);
-
-  const segment = {
-    name, curve, geometry, tunnel, chamber, tip, face, radius, start, duration,
-    chamberScale: new THREE.Vector3(...chamberScale),
+function addTunnelSegment(name, points, radius, start, duration, chamberScale, parentSegmentIndex = null) {
+  const segmentIndex = tunnelSegments.length;
+  const fromNode = parentSegmentIndex == null
+    ? addNestNode(homeNestGraph, {
+      id: `${HOME_COLONY_ID}-legacy-entrance`,
+      type: 'entrance',
+      position: points[0],
+      completed: true,
+      renderChamber: false,
+    })
+    : homeNestGraph.nodes.get(tunnelSegments[parentSegmentIndex].toNodeId);
+  const toNode = addNestNode(homeNestGraph, {
+    id: `${HOME_COLONY_ID}-legacy-chamber-${segmentIndex}`,
+    type: name,
+    position: points[points.length - 1],
+    completed: false,
+    targetScale: chamberScale,
+  });
+  const segment = addNestEdge(homeNestGraph, {
+    id: `${HOME_COLONY_ID}-legacy-tunnel-${segmentIndex}`,
+    name,
+    fromNodeId: fromNode.id,
+    toNodeId: toNode.id,
+    controlPoints: points,
+    radius,
+    tension: 0.38,
+    start,
+    duration,
+    chamberScale,
+    frontRotation: segmentIndex * 0.73,
     progress: 0,
     work: 0,
-    workRequired: Math.max(30, curve.getLength() * 20),
-    activeDiggers: 0,
     available: false,
-  };
+  });
+  segment.activeDiggers = 0;
+  homeNestPresenter.syncTopology(homeNestGraph);
+  segment.workRequired = Math.max(30, homeNestPresenter.curveFor(segment).getLength() * 20);
   tunnelSegments.push(segment);
   return segment;
 }
@@ -1462,28 +1478,32 @@ addTunnelSegment('entrance shaft', [
 ], 0.36, -50, 25, [1.5, 0.62, 1.1]);
 addTunnelSegment('western nursery', [
   V(-5.55, -1.45, -1.2), V(-7.0, -2.0, -2.45), V(-8.8, -2.75, -3.65), V(-10.2, -3.15, -2.55),
-], 0.29, -50, 30, [1.8, 0.55, 1.12]);
+], 0.29, -50, 30, [1.8, 0.55, 1.12], 0);
 addTunnelSegment('eastern stores', [
   V(-5.18, -2.5, -1.62), V(-3.45, -3.0, -0.35), V(-1.15, -3.75, 1.55), V(0.45, -4.25, 0.65),
-], 0.31, -50, 32, [1.65, 0.52, 1.18]);
+], 0.31, -50, 32, [1.65, 0.52, 1.18], 0);
 addTunnelSegment('descending gallery', [
   V(-5.55, -4.12, -0.8), V(-4.85, -5.2, -0.05), V(-5.2, -6.45, 1.3), V(-4.4, -7.5, 0.7),
-], 0.34, -45, 34, [1.42, 0.58, 1.25]);
+], 0.34, -45, 34, [1.42, 0.58, 1.25], 0);
 addTunnelSegment('western deep chamber', [
   V(-5.15, -6.4, 1.25), V(-7.0, -6.85, 2.45), V(-8.8, -7.35, 4.25), V(-10.4, -7.75, 3.5),
-], 0.28, 12, 48, [1.72, 0.56, 1.08]);
+], 0.28, 12, 48, [1.72, 0.56, 1.08], 3);
 addTunnelSegment('southeast gallery', [
   V(-4.42, -7.48, 0.7), V(-2.05, -7.9, -1.25), V(0.65, -8.15, -3.85), V(2.45, -8.5, -3.25),
-], 0.3, 28, 54, [1.7, 0.5, 1.2]);
+], 0.3, 28, 54, [1.7, 0.5, 1.2], 3);
 addTunnelSegment('lower shaft', [
   V(-4.42, -7.48, 0.7), V(-4.9, -8.75, 0.15), V(-3.8, -10.15, 1.2), V(-4.35, -11.6, 0.35),
-], 0.33, 48, 48, [1.48, 0.6, 1.16]);
+], 0.33, 48, 48, [1.48, 0.6, 1.16], 3);
 addTunnelSegment('lower western fork', [
   V(-4.32, -11.55, 0.35), V(-6.25, -11.05, -1.55), V(-8.1, -11.4, -3.5), V(-9.5, -11.75, -4.15),
-], 0.27, 76, 52, [1.6, 0.52, 1.08]);
+], 0.27, 76, 52, [1.6, 0.52, 1.08], 6);
 addTunnelSegment('lower eastern fork', [
   V(-4.32, -11.55, 0.35), V(-2.5, -11.1, 2.0), V(-0.6, -11.45, 4.15), V(1.25, -11.85, 5.0),
-], 0.27, 96, 58, [1.55, 0.5, 1.2]);
+], 0.27, 96, 58, [1.55, 0.5, 1.2], 6);
+
+const homeNestCurve = (segmentOrIndex) => homeNestPresenter.curveFor(
+  typeof segmentOrIndex === 'number' ? tunnelSegments[segmentOrIndex] : segmentOrIndex,
+);
 
 function closestCurveT(curve, point) {
   let bestT = 0;
@@ -1500,11 +1520,11 @@ function closestCurveT(curve, point) {
 
 function nestLeg(segmentIndex, from = 0, to = 1) {
   const segment = tunnelSegments[segmentIndex];
-  return { segmentIndex, from, to, length: Math.max(0.1, segment.curve.getLength() * Math.abs(to - from)) };
+  return { segmentIndex, from, to, length: Math.max(0.1, homeNestCurve(segment).getLength() * Math.abs(to - from)) };
 }
 
-const nurseryJoin = closestCurveT(tunnelSegments[0].curve, tunnelSegments[1].curve.getPointAt(0));
-const storesJoin = closestCurveT(tunnelSegments[0].curve, tunnelSegments[2].curve.getPointAt(0));
+const nurseryJoin = closestCurveT(homeNestCurve(0), homeNestCurve(1).getPointAt(0));
+const storesJoin = closestCurveT(homeNestCurve(0), homeNestCurve(2).getPointAt(0));
 const VESTIBULE_T = Math.min(0.22, storesJoin * 0.58);
 const NEST_ROUTES = {
   vestibule: { label: 'entrance vestibule', legs: [nestLeg(0, 0, VESTIBULE_T)] },
@@ -1514,7 +1534,7 @@ const NEST_ROUTES = {
   rest: { label: 'deep resting chamber', legs: [nestLeg(0), nestLeg(3)] },
 };
 
-const vestibuleCenter = tunnelSegments[0].curve.getPointAt(VESTIBULE_T).clone();
+const vestibuleCenter = homeNestCurve(0).getPointAt(VESTIBULE_T).clone();
 const vestibuleShell = new THREE.Group();
 const vestibuleGeometry = new THREE.SphereGeometry(1, 18, 11);
 vestibuleShell.add(
@@ -1568,7 +1588,7 @@ function makeGranaryVisual(parent, center, capacity, color) {
   return mesh;
 }
 
-const homeGranaryCenter = tunnelSegments[2].curve.getPointAt(1).clone();
+const homeGranaryCenter = homeNestCurve(2).getPointAt(1).clone();
 const homeGranaryVisual = makeGranaryVisual(homeNestScanGroup, homeGranaryCenter, 76, 0xd9b965);
 
 const entranceCachePool = Array.from({ length: 48 }, () => {
@@ -1582,11 +1602,13 @@ const entranceCachePool = Array.from({ length: 48 }, () => {
   return item;
 });
 
-const descendingJoinWestern = closestCurveT(tunnelSegments[3].curve, tunnelSegments[4].curve.getPointAt(0));
+const descendingJoinWestern = closestCurveT(homeNestCurve(3), homeNestCurve(4).getPointAt(0));
 for (let i = 0; i < tunnelSegments.length; i++) {
   const established = i <= 3;
-  tunnelSegments[i].progress = established ? 1 : (i === 4 ? 0.045 : i === 5 ? 0.025 : 0);
-  tunnelSegments[i].work = tunnelSegments[i].progress * tunnelSegments[i].workRequired;
+  const progress = established ? 1 : (i === 4 ? 0.045 : i === 5 ? 0.025 : 0);
+  updateNestEdgeProgress(homeNestGraph, tunnelSegments[i], progress, {
+    work: progress * tunnelSegments[i].workRequired,
+  });
 }
 
 function refreshConstructionProjects() {
@@ -1941,24 +1963,59 @@ function updateShedWingLifecycle(dt) {
   }
 }
 
-const rivalNestScanGroup = new THREE.Group();
-rivalNestScanGroup.name = 'rival-nest-scan';
-undergroundGroup.add(rivalNestScanGroup);
-const rivalTunnelMaterial = new THREE.MeshBasicMaterial({ color: 0x55738c, transparent: true, opacity: 0.09, side: THREE.DoubleSide, depthWrite: false, fog: false });
-const rivalWireMaterial = new THREE.MeshBasicMaterial({ color: 0x82a9bd, wireframe: true, transparent: true, opacity: 0.36, side: THREE.DoubleSide, depthWrite: false, fog: false });
+const rivalNestGraph = createNestGraph({ colonyId: `${RIVAL_COLONY_ID}-legacy` });
+const rivalNestPresenter = createNestPresenter({
+  parent: undergroundGroup,
+  name: 'rival-nest-scan',
+  color: 0x55738c,
+  wireColor: 0x82a9bd,
+  chamberColor: 0x55738c,
+  chamberWireColor: 0x82a9bd,
+  fillOpacity: 0.09,
+  wireOpacity: 0.36,
+  chamberFillOpacity: 0.09,
+  chamberWireOpacity: 0.36,
+  tubeSegments: 64,
+  radialSegments: 9,
+  chamberSegments: 18,
+  chamberRings: 12,
+  createFront: false,
+});
+const rivalNestScanGroup = rivalNestPresenter.group;
 const rivalNestCurves = [];
 
-function addRivalNestTunnel(points, radius, chamberScale) {
-  const curve = new THREE.CatmullRomCurve3(points, false, 'catmullrom', 0.4);
+function addRivalNestTunnel(points, radius, chamberScale, parentSegmentIndex = null) {
+  const segmentIndex = rivalNestCurves.length;
+  const fromNode = parentSegmentIndex == null
+    ? addNestNode(rivalNestGraph, {
+      id: `${RIVAL_COLONY_ID}-legacy-entrance`,
+      type: 'entrance',
+      position: points[0],
+      completed: true,
+      renderChamber: false,
+    })
+    : rivalNestGraph.nodes.get(nestEdges(rivalNestGraph)[parentSegmentIndex].toNodeId);
+  const toNode = addNestNode(rivalNestGraph, {
+    id: `${RIVAL_COLONY_ID}-legacy-chamber-${segmentIndex}`,
+    type: 'legacy',
+    position: points[points.length - 1],
+    completed: true,
+    targetScale: chamberScale,
+  });
+  const edge = addNestEdge(rivalNestGraph, {
+    id: `${RIVAL_COLONY_ID}-legacy-tunnel-${segmentIndex}`,
+    fromNodeId: fromNode.id,
+    toNodeId: toNode.id,
+    controlPoints: points,
+    radius,
+    tension: 0.4,
+    progress: 1,
+    completed: true,
+    chamberScale,
+  });
+  rivalNestPresenter.syncTopology(rivalNestGraph);
+  const curve = rivalNestPresenter.curveFor(edge);
   rivalNestCurves.push(curve);
-  const geometry = new THREE.TubeGeometry(curve, 64, radius, 9, false);
-  rivalNestScanGroup.add(new THREE.Mesh(geometry, rivalTunnelMaterial), new THREE.Mesh(geometry, rivalWireMaterial));
-  const chamberGeometry = new THREE.SphereGeometry(1, 18, 12);
-  const chamber = new THREE.Group();
-  chamber.add(new THREE.Mesh(chamberGeometry, rivalTunnelMaterial), new THREE.Mesh(chamberGeometry, rivalWireMaterial));
-  chamber.position.copy(points[points.length - 1]);
-  chamber.scale.set(...chamberScale);
-  rivalNestScanGroup.add(chamber);
   return curve;
 }
 
@@ -1968,13 +2025,13 @@ addRivalNestTunnel([
 ], 0.34, [1.42, 0.56, 1.05]);
 const rivalNurseryCurve = addRivalNestTunnel([
   V(8.4, -3.6, -4.9), V(9.4, -4.0, -5.8), V(10.4, -4.5, -6.6), V(11.25, -4.85, -7.15),
-], 0.29, [1.62, 0.52, 1.12]);
+], 0.29, [1.62, 0.52, 1.12], 0);
 const rivalStoresCurve = addRivalNestTunnel([
   V(8.4, -3.6, -4.9), V(7.5, -3.9, -4.5), V(6.6, -4.15, -4.0), V(5.7, -4.4, -3.75),
-], 0.27, [1.48, 0.48, 1.04]);
+], 0.27, [1.48, 0.48, 1.04], 0);
 addRivalNestTunnel([
   V(8.4, -3.6, -4.9), V(8.1, -5.0, -3.8), V(8.65, -6.2, -2.5), V(9.0, -7.15, -1.45),
-], 0.31, [1.5, 0.55, 1.1]);
+], 0.31, [1.5, 0.55, 1.1], 0);
 
 const rivalNurseryCenter = rivalNurseryCurve.getPointAt(1).clone();
 const rivalGranaryVisual = makeGranaryVisual(rivalNestScanGroup, rivalStoresCurve.getPointAt(1), 58, 0xb9c77a);
@@ -2007,7 +2064,7 @@ const rivalTransferPool = Array.from({ length: 16 }, (_, i) => {
   }));
   sprite.visible = false;
   sprite.renderOrder = 9;
-  sprite.userData.workerId = null;
+  sprite.userData.workerUid = null;
   rivalNestScanGroup.add(sprite);
   return sprite;
 });
@@ -2051,7 +2108,7 @@ function updateRivalUndergroundVisuals() {
     rival.nestPosition.copy(sprite.position);
     sprite.scale.setScalar(rival.size * 0.34);
     sprite.material.rotation = -rival.heading + Math.PI * 0.5;
-    sprite.userData.workerId = rival.id;
+    sprite.userData.workerUid = rival.runtimeUid || workerRuntimeUid(rival.colonyId, rival.id);
     sprite.visible = true;
   }
   for (let i = visibleTransfers; i < rivalTransferPool.length; i++) rivalTransferPool[i].visible = false;
@@ -2060,7 +2117,7 @@ function updateRivalUndergroundVisuals() {
 
 // ---------- Phase 8A: shared, pressure-driven nest architecture ----------
 const colonyNestArchitectures = new Map();
-const architectureChamberGeometry = new THREE.SphereGeometry(1, 18, 12);
+const colonyNestPresentations = new Map();
 const architectureSpoilGeometry = new THREE.DodecahedronGeometry(0.11, 0);
 const architectureSpoilMaterial = new THREE.MeshStandardMaterial({ color: 0x895a3d, roughness: 1, flatShading: true });
 const architectureSpoil = [];
@@ -2071,79 +2128,54 @@ function architectureColor(colony) {
 
 function createArchitectureNode(architecture, type, position, options = {}) {
   const profile = ARCHITECTURE_TYPES[type] || ARCHITECTURE_TYPES.resting;
-  const node = {
-    id: `${architecture.colonyId}-chamber-${architecture.nextNodeId++}`,
+  return addNestNode(architecture, {
     type,
-    position: position.clone(),
+    position,
     parentId: options.parentId || null,
     capacity: options.capacity ?? profile.capacity,
     storageCapacity: options.storageCapacity ?? profile.storage,
     completed: options.completed ?? false,
-    children: 0,
     renderChamber: options.renderChamber !== false,
-    chamber: new THREE.Group(),
-    targetScale: new THREE.Vector3(...profile.scale),
-  };
-  if (node.renderChamber) {
-    node.chamber.add(
-      new THREE.Mesh(architectureChamberGeometry, architecture.fillMaterial),
-      new THREE.Mesh(architectureChamberGeometry, architecture.wireMaterial),
-    );
-    node.chamber.position.copy(node.position);
-    node.chamber.scale.setScalar(node.completed ? 1 : 0.001);
-    architecture.group.add(node.chamber);
-  } else node.chamber.visible = false;
-  architecture.nodes.push(node);
-  return node;
+    targetScale: profile.scale,
+  });
 }
 
 function createArchitectureEdge(architecture, fromNode, toNode, options = {}) {
-  const delta = new THREE.Vector3().subVectors(toNode.position, fromNode.position);
+  const fromPosition = new THREE.Vector3(fromNode.position.x, fromNode.position.y, fromNode.position.z);
+  const toPosition = new THREE.Vector3(toNode.position.x, toNode.position.y, toNode.position.z);
+  const delta = new THREE.Vector3().subVectors(toPosition, fromPosition);
   const side = new THREE.Vector3(-delta.z, 0, delta.x).normalize().multiplyScalar(options.bend ?? rand(-0.42, 0.42));
   const points = [
-    fromNode.position.clone(),
-    fromNode.position.clone().lerp(toNode.position, 0.34).add(side),
-    fromNode.position.clone().lerp(toNode.position, 0.68).addScaledVector(side, -0.55),
-    toNode.position.clone(),
+    fromPosition,
+    fromPosition.clone().lerp(toPosition, 0.34).add(side),
+    fromPosition.clone().lerp(toPosition, 0.68).addScaledVector(side, -0.55),
+    toPosition,
   ];
-  const curve = new THREE.CatmullRomCurve3(points, false, 'catmullrom', 0.42);
   const radius = ARCHITECTURE_TYPES[toNode.type]?.radius || 0.23;
-  const geometry = new THREE.TubeGeometry(curve, 48, radius, 8, false);
-  const fill = new THREE.Mesh(geometry, architecture.fillMaterial);
-  const wire = new THREE.Mesh(geometry, architecture.wireMaterial);
-  architecture.group.add(fill, wire);
-  const front = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(radius * 0.78, 1),
-    new THREE.MeshBasicMaterial({ color: architecture.color, transparent: true, opacity: 0.66, fog: false }),
-  );
-  architecture.group.add(front);
   const progress = options.progress ?? 0;
-  const edge = {
-    id: `${architecture.colonyId}-tunnel-${architecture.nextEdgeId++}`,
+  const edge = addNestEdge(architecture, {
     fromNodeId: fromNode.id,
     toNodeId: toNode.id,
-    curve,
-    geometry,
-    fill,
-    wire,
-    front,
+    controlPoints: points,
+    radius,
+    tension: 0.42,
     progress,
-    workRequired: Math.max(54, curve.getLength() * 31),
     work: 0,
-    activeDiggers: [],
     completed: progress >= 1,
-  };
+    chamberScale: toNode.targetScale,
+  });
+  const presentation = colonyNestPresentations.get(architecture.colonyId);
+  presentation.presenter.syncTopology(architecture);
+  edge.workRequired = Math.max(54, presentation.presenter.curveFor(edge).getLength() * 31);
   edge.work = edge.workRequired * progress;
-  fromNode.children++;
-  architecture.edges.push(edge);
   return edge;
 }
 
-function createArchitectureWorkerPool(architecture, count = 18) {
+function createArchitectureWorkerPool(architecture, presentation, count = 18) {
   return Array.from({ length: count }, (_, index) => {
     const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
       map: antMaterials[index % antMaterials.length].map,
-      color: architecture.color,
+      color: presentation.color,
       transparent: true,
       alphaTest: 0.045,
       depthWrite: false,
@@ -2152,12 +2184,12 @@ function createArchitectureWorkerPool(architecture, count = 18) {
     }));
     sprite.visible = false;
     sprite.renderOrder = 10;
-    architecture.group.add(sprite);
+    presentation.presenter.group.add(sprite);
     return sprite;
   });
 }
 
-function createArchitectureBroodPool(architecture, count = 18) {
+function createArchitectureBroodPool(presentation, count = 18) {
   return Array.from({ length: count }, () => {
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(1, 8, 5),
@@ -2165,7 +2197,7 @@ function createArchitectureBroodPool(architecture, count = 18) {
     );
     mesh.visible = false;
     mesh.renderOrder = 9;
-    architecture.group.add(mesh);
+    presentation.presenter.group.add(mesh);
     return mesh;
   });
 }
@@ -2173,20 +2205,16 @@ function createArchitectureBroodPool(architecture, count = 18) {
 function createColonyArchitecture(colony, options = {}) {
   if (!colony || colonyNestArchitectures.has(colony.id)) return colonyNestArchitectures.get(colony?.id) || null;
   const color = architectureColor(colony);
-  const group = new THREE.Group();
-  group.name = `${colony.id}-living-architecture`;
-  group.visible = false;
-  undergroundGroup.add(group);
-  const architecture = {
+  const architecture = createNestGraph({
     colonyId: colony.id,
-    group,
+    capacity: {
+      habitable: options.baseCapacity || 0,
+      brood: options.baseBroodCapacity || 0,
+      storage: options.baseStorageCapacity || 0,
+    },
+  });
+  Object.assign(architecture, {
     color: color.getHex(),
-    fillMaterial: new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.095, side: THREE.DoubleSide, depthWrite: false, fog: false }),
-    wireMaterial: new THREE.MeshBasicMaterial({ color: color.clone().offsetHSL(0.02, -0.05, 0.2), wireframe: true, transparent: true, opacity: 0.42, side: THREE.DoubleSide, depthWrite: false, fog: false }),
-    nodes: [],
-    edges: [],
-    nextNodeId: 1,
-    nextEdgeId: 1,
     baseChambers: options.baseChambers || 0,
     baseCapacity: options.baseCapacity || 0,
     baseBroodCapacity: options.baseBroodCapacity || 0,
@@ -2206,13 +2234,24 @@ function createColonyArchitecture(colony, options = {}) {
     circulationSeconds: 0,
     inspectionTrips: 0,
     visitedChamberIds: new Set(),
+  });
+  const presentation = {
+    color: color.getHex(),
+    presenter: createNestPresenter({
+      parent: undergroundGroup,
+      name: `${colony.id}-living-architecture`,
+      color: color.getHex(),
+      wireColor: color.clone().offsetHSL(0.02, -0.05, 0.2).getHex(),
+    }),
     queenSprite: null,
     workerPool: null,
     broodPool: null,
+    released: false,
   };
+  colonyNestPresentations.set(colony.id, presentation);
   const rootPosition = options.anchor?.clone() || new THREE.Vector3(colony.nest.x, groundHeight(colony.nest.x, colony.nest.y) - 0.05, colony.nest.y);
   const root = createArchitectureNode(architecture, 'shaft', rootPosition, { completed: true, renderChamber: false, capacity: 0, storageCapacity: 0 });
-  architecture.rootNodeId = root.id;
+  architecture.entranceNodeId = root.id;
   if (architecture.founding) {
     const chamber = createArchitectureNode(
       architecture,
@@ -2232,17 +2271,17 @@ function createColonyArchitecture(colony, options = {}) {
       depthTest: false,
       fog: false,
     });
-    architecture.queenSprite = new THREE.Sprite(queenMaterial);
-    architecture.queenSprite.position.copy(chamber.position).add(new THREE.Vector3(-0.15, 0.08, 0));
-    architecture.queenSprite.scale.set(0.82, 0.82, 1);
-    architecture.queenSprite.renderOrder = 10;
-    group.add(architecture.queenSprite);
+    presentation.queenSprite = new THREE.Sprite(queenMaterial);
+    presentation.queenSprite.position.set(chamber.position.x - 0.15, chamber.position.y + 0.08, chamber.position.z);
+    presentation.queenSprite.scale.set(0.82, 0.82, 1);
+    presentation.queenSprite.renderOrder = 10;
+    presentation.presenter.group.add(presentation.queenSprite);
   }
-  architecture.workerPool = createArchitectureWorkerPool(architecture);
-  architecture.broodPool = createArchitectureBroodPool(architecture);
+  presentation.workerPool = createArchitectureWorkerPool(architecture, presentation);
+  presentation.broodPool = createArchitectureBroodPool(presentation);
   const light = new THREE.PointLight(color, architecture.founding ? 11 : 8, 9, 2);
   light.position.copy(rootPosition).add(new THREE.Vector3(0, -1.2, 0));
-  group.add(light);
+  presentation.presenter.group.add(light);
   colonyNestArchitectures.set(colony.id, architecture);
   colony.architecture = architecture;
   colony.undergroundView = true;
@@ -2252,15 +2291,27 @@ function createColonyArchitecture(colony, options = {}) {
 }
 
 function chamberDepth(architecture) {
-  return architecture.nodes.reduce((depth, node) => Math.min(depth, node.position.y), 0);
+  return nestNodes(architecture).reduce((depth, node) => Math.min(depth, node.position.y), 0);
 }
 
 function architectureNodeById(architecture, id) {
-  return architecture.nodes.find((node) => node.id === id) || null;
+  return architecture.nodes.get(id) || null;
 }
 
 function architecturePressure(architecture, colony) {
-  const pressure = calculateArchitecturePressure(architecture, colony);
+  if (architecture.pressureTopologyRevision !== architecture.graphRevision) {
+    const completedNodes = nestNodes(architecture).filter((node) => node.completed);
+    architecture.pressureHabitableCapacity = architecture.baseCapacity
+      + completedNodes.reduce((sum, node) => sum + node.capacity, 0);
+    architecture.pressureStorageCapacity = architecture.baseStorageCapacity
+      + completedNodes.reduce((sum, node) => sum + node.storageCapacity, 0);
+    architecture.pressureTopologyRevision = architecture.graphRevision;
+  }
+  const pressure = calculateArchitecturePressure(architecture, colony, {
+    livingWorkerCount: workerCensus.colonyCount(colony.id),
+    habitableCapacity: architecture.pressureHabitableCapacity,
+    storageCapacity: architecture.pressureStorageCapacity,
+  });
   architecture.habitableCapacity = pressure.habitableCapacity;
   architecture.storageCapacity = pressure.storageCapacity;
   architecture.occupancy = pressure.occupancy;
@@ -2270,6 +2321,7 @@ function architecturePressure(architecture, colony) {
   architecture.growthDrive = pressure.growthDrive;
   return {
     workers: pressure.workers,
+    workerCount: pressure.workerCount,
     brood: pressure.brood,
     storagePressure: pressure.storagePressure,
     usefulStoragePressure: pressure.usefulStoragePressure,
@@ -2294,7 +2346,7 @@ function acceptColonyStoredFood(colonyId, current, incoming = 0) {
 
 function consumeColonyStoredFood(colonyId, current, dt, workerCount, options = {}) {
   const colony = getColony(colonyId);
-  const completedGranaries = colony?.architecture?.nodes
+  const completedGranaries = nestNodes(colony?.architecture)
     .filter((node) => node.completed && node.type === 'granary').length || 0;
   const { next, metabolized, spoiled } = calculateStoredFoodConsumption({
     current,
@@ -2331,12 +2383,13 @@ function demographicStateFor(colony, careRatio = 1) {
 }
 
 function startArchitectureProject(architecture, colony, pressure) {
-  const availableParents = architecture.nodes
+  const nodes = nestNodes(architecture);
+  const availableParents = nodes
     .filter((node) => node.completed && node.renderChamber && node.children < 2)
     .sort((a, b) => a.children - b.children || a.position.y - b.position.y);
-  const root = architectureNodeById(architecture, architecture.rootNodeId);
+  const root = architectureNodeById(architecture, architecture.entranceNodeId);
   const parent = availableParents[Math.floor(random() * Math.min(3, availableParents.length))]
-    || architecture.nodes.filter((node) => node.completed).sort((a, b) => a.position.y - b.position.y)[0]
+    || nodes.filter((node) => node.completed).sort((a, b) => a.position.y - b.position.y)[0]
     || root;
   const type = chooseArchitectureChamberType(architecture, pressure);
   let candidate = null;
@@ -2350,7 +2403,11 @@ function startArchitectureProject(architecture, colony, pressure) {
       Math.max(-12.4, y),
       clamp(parent.position.z + Math.sin(angle) * horizontal, -HALF_D + 1, HALF_D - 1),
     );
-    if (architecture.nodes.every((node) => node.position.distanceTo(trial) > 1.45)) { candidate = trial; break; }
+    if (nodes.every((node) => Math.hypot(
+      node.position.x - trial.x,
+      node.position.y - trial.y,
+      node.position.z - trial.z,
+    ) > 1.45)) { candidate = trial; break; }
   }
   if (!candidate) return null;
   const node = createArchitectureNode(architecture, type, candidate, { parentId: parent.id });
@@ -2359,8 +2416,13 @@ function startArchitectureProject(architecture, colony, pressure) {
     const youngScale = colony.status === 'young' ? 0.58 : 0.78;
     node.capacity = Math.max(6, Math.round(node.capacity * youngScale));
     node.storageCapacity = Math.max(1, Math.round(node.storageCapacity * youngScale));
-    node.targetScale.multiplyScalar(colony.status === 'young' ? 0.74 : 0.86);
+    const scale = colony.status === 'young' ? 0.74 : 0.86;
+    node.targetScale.x *= scale;
+    node.targetScale.y *= scale;
+    node.targetScale.z *= scale;
+    edge.chamberScale = { ...node.targetScale };
     edge.workRequired *= colony.status === 'young' ? 0.44 : 0.68;
+    markNestGraphChanged(architecture);
   }
   architecture.growthIndex++;
   architecture.lastGrowthAt = simTime;
@@ -2384,8 +2446,14 @@ function depositArchitectureSpoil(architecture, colony) {
   architecture.spoilDeposits++;
 }
 
+function architectureAssignedDiggers(colony, edge) {
+  if (!edge) return [];
+  const assignedIds = new Set(edge.activeDiggerIds || []);
+  return colony.workers.filter((worker) => assignedIds.has(workerDisplayId(worker)));
+}
+
 function advanceArchitectureCirculation(architecture, colony, dt, assignedDiggers = []) {
-  const completedEdges = architecture.edges.filter((edge) => edge.completed);
+  const completedEdges = nestEdges(architecture).filter((edge) => edge.completed);
   if (completedEdges.length === 0) {
     architecture.circulatingWorkers = [];
     return;
@@ -2400,16 +2468,20 @@ function advanceArchitectureCirculation(architecture, colony, dt, assignedDigger
   while (active.length < desired && recruits.length > 0) {
     const worker = recruits.shift();
     worker.architectureCirculation ||= {
-      currentNodeId: architecture.rootNodeId,
+      currentNodeId: architecture.entranceNodeId,
       previousNodeId: null,
       edgeId: null,
       direction: 1,
       t: 0,
       pause: rand(0.2, 1.5),
-      position: architectureNodeById(architecture, architecture.rootNodeId).position.clone(),
+      position: new THREE.Vector3(
+        architectureNodeById(architecture, architecture.entranceNodeId).position.x,
+        architectureNodeById(architecture, architecture.entranceNodeId).position.y,
+        architectureNodeById(architecture, architecture.entranceNodeId).position.z,
+      ),
       heading: 0,
       visits: 0,
-      visitedNodeIds: new Set([architecture.rootNodeId]),
+      visitedNodeIds: new Set([architecture.entranceNodeId]),
       dutyUntil: 0,
     };
     worker.architectureCirculation.dutyUntil = simTime + rand(24, 52);
@@ -2443,14 +2515,15 @@ function advanceArchitectureCirculation(architecture, colony, dt, assignedDigger
     }
     const edge = route.edgeId ? completedEdges.find((candidate) => candidate.id === route.edgeId) : null;
     if (!edge) {
-      const node = architectureNodeById(architecture, route.currentNodeId) || architectureNodeById(architecture, architecture.rootNodeId);
-      route.position.copy(node.position);
+      const node = architectureNodeById(architecture, route.currentNodeId) || architectureNodeById(architecture, architecture.entranceNodeId);
+      route.position.set(node.position.x, node.position.y, node.position.z);
       continue;
     }
-    const length = Math.max(0.5, edge.curve.getLength());
+    const curve = colonyNestPresentations.get(architecture.colonyId).presenter.curveFor(edge);
+    const length = Math.max(0.5, curve.getLength());
     route.t = clamp(route.t + route.direction * dt * (worker.speed || 0.8) * 0.42 / length, 0, 1);
-    edge.curve.getPointAt(route.t, route.position);
-    const tangent = edge.curve.getTangentAt(route.t);
+    curve.getPointAt(route.t, route.position);
+    const tangent = curve.getTangentAt(route.t);
     route.heading = Math.atan2(tangent.z, tangent.x) + (route.direction < 0 ? Math.PI : 0);
     const arrived = route.direction > 0 ? route.t >= 0.999 : route.t <= 0.001;
     if (arrived) {
@@ -2469,32 +2542,26 @@ function advanceArchitectureCirculation(architecture, colony, dt, assignedDigger
 }
 
 function updateArchitectureVisual(architecture, colony) {
-  architecture.group.visible = cameraRig.focusedColonyId === architecture.colonyId;
-  let activeEdge = null;
-  for (const edge of architecture.edges) {
-    const count = edge.geometry.index.count;
-    edge.geometry.setDrawRange(0, Math.floor(count * clamp(edge.progress, 0, 1) / 6) * 6);
-    const node = architectureNodeById(architecture, edge.toNodeId);
-    const chamberProgress = clamp((edge.progress - 0.72) / 0.28, 0, 1);
-    if (node?.renderChamber) {
-      node.chamber.visible = chamberProgress > 0 || edge.completed;
-      node.chamber.scale.copy(node.targetScale).multiplyScalar(edge.completed ? 1 : Math.max(0.001, chamberProgress));
-    }
-    edge.front.visible = !edge.completed;
-    if (!edge.completed) {
-      edge.curve.getPointAt(Math.max(0.012, edge.progress), edge.front.position);
-      edge.front.scale.setScalar(0.76 + Math.sin(simTime * 5.2) * 0.18);
-      activeEdge = edge;
-    }
-  }
+  const presentation = colonyNestPresentations.get(architecture.colonyId);
+  if (!presentation || presentation.released) return;
+  const edges = nestEdges(architecture);
+  const nodes = nestNodes(architecture);
+  const activeEdge = edges.find((edge) => !edge.completed) || null;
+  presentation.presenter.syncGraph(architecture, {
+    visible: cameraRig.focusedColonyId === architecture.colonyId,
+    simTime,
+    activeFrontIds: activeEdge ? [activeEdge.id] : [],
+  });
 
-  const workers = colony.workers.filter((worker) => worker.alive !== false);
+  const workers = colony.workers.filter((worker) => worker.alive !== false && worker.insideNest);
   let visibleWorkers = 0;
-  const assigned = activeEdge ? activeEdge.activeDiggers : [];
-  for (let i = 0; i < assigned.length && visibleWorkers < architecture.workerPool.length; i++) {
+  const assigned = architectureAssignedDiggers(colony, activeEdge).filter((worker) => worker.insideNest);
+  const activeCurve = activeEdge ? presentation.presenter.curveFor(activeEdge) : null;
+  for (let i = 0; i < assigned.length && visibleWorkers < presentation.workerPool.length; i++) {
     const worker = assigned[i];
-    const sprite = architecture.workerPool[visibleWorkers++];
-    activeEdge.curve.getPointAt(Math.max(0.012, activeEdge.progress), sprite.position);
+    const sprite = presentation.workerPool[visibleWorkers++];
+    sprite.userData.workerUid = worker.runtimeUid || workerRuntimeUid(worker.colonyId, worker.id);
+    activeCurve.getPointAt(Math.max(0.012, activeEdge.progress), sprite.position);
     const angle = i * 2.399 + simTime * 0.8;
     sprite.position.add(new THREE.Vector3(Math.cos(angle) * 0.22, Math.sin(angle * 1.4) * 0.1, Math.sin(angle) * 0.22));
     sprite.scale.setScalar((worker.size || 0.8) * 0.38);
@@ -2502,10 +2569,11 @@ function updateArchitectureVisual(architecture, colony) {
     sprite.visible = true;
   }
   const circulating = architecture.circulatingWorkers.filter((worker) => !assigned.includes(worker));
-  for (let i = 0; i < circulating.length && visibleWorkers < architecture.workerPool.length; i++) {
+  for (let i = 0; i < circulating.length && visibleWorkers < presentation.workerPool.length; i++) {
     const worker = circulating[i];
     const route = worker.architectureCirculation;
-    const sprite = architecture.workerPool[visibleWorkers++];
+    const sprite = presentation.workerPool[visibleWorkers++];
+    sprite.userData.workerUid = worker.runtimeUid || workerRuntimeUid(worker.colonyId, worker.id);
     sprite.position.copy(route.position);
     sprite.position.y += Math.sin(simTime * 4.2 + worker.id) * 0.035;
     sprite.scale.setScalar((worker.size || 0.72) * 0.37);
@@ -2513,98 +2581,132 @@ function updateArchitectureVisual(architecture, colony) {
     sprite.visible = true;
   }
   if (!architecture.legacyVisuals) {
-    const chamberNodes = architecture.nodes.filter((node) => node.completed && node.renderChamber);
-    for (let i = 0; i < workers.length && visibleWorkers < architecture.workerPool.length && chamberNodes.length > 0; i++) {
+    const chamberNodes = nodes.filter((node) => node.completed && node.renderChamber);
+    for (let i = 0; i < workers.length && visibleWorkers < presentation.workerPool.length && chamberNodes.length > 0; i++) {
       const worker = workers[i];
       if (assigned.includes(worker) || circulating.includes(worker)) continue;
-      const sprite = architecture.workerPool[visibleWorkers++];
+      const sprite = presentation.workerPool[visibleWorkers++];
+      sprite.userData.workerUid = worker.runtimeUid || workerRuntimeUid(worker.colonyId, worker.id);
       const node = chamberNodes[i % chamberNodes.length];
       const angle = i * 2.399 + simTime * (0.03 + (i % 4) * 0.008);
-      sprite.position.copy(node.position).add(new THREE.Vector3(Math.cos(angle) * 0.42, Math.sin(simTime + i) * 0.08, Math.sin(angle) * 0.3));
+      sprite.position.set(
+        node.position.x + Math.cos(angle) * 0.42,
+        node.position.y + Math.sin(simTime + i) * 0.08,
+        node.position.z + Math.sin(angle) * 0.3,
+      );
       sprite.scale.setScalar((worker.size || 0.72) * 0.36);
       sprite.material.rotation = -angle;
       sprite.visible = true;
     }
   }
-  for (let i = visibleWorkers; i < architecture.workerPool.length; i++) architecture.workerPool[i].visible = false;
+  for (let i = visibleWorkers; i < presentation.workerPool.length; i++) presentation.workerPool[i].visible = false;
 
   const brood = colony.brood || [];
-  const nurseryNodes = architecture.nodes.filter((node) => node.completed && (node.type === 'nursery' || node.type === 'founding'));
+  const nurseryNodes = nodes.filter((node) => node.completed && (node.type === 'nursery' || node.type === 'founding'));
   let visibleBrood = 0;
-  if (!architecture.legacyVisuals && nurseryNodes.length > 0) for (let i = 0; i < brood.length && visibleBrood < architecture.broodPool.length; i++) {
+  if (!architecture.legacyVisuals && nurseryNodes.length > 0) for (let i = 0; i < brood.length && visibleBrood < presentation.broodPool.length; i++) {
     const item = brood[i];
-    const mesh = architecture.broodPool[visibleBrood++];
+    const mesh = presentation.broodPool[visibleBrood++];
     const node = nurseryNodes[i % nurseryNodes.length];
     const angle = i * 2.399;
-    mesh.position.copy(node.position).add(new THREE.Vector3(Math.cos(angle) * 0.34, -0.1 + Math.sin(i) * 0.05, Math.sin(angle) * 0.24));
+    mesh.position.set(
+      node.position.x + Math.cos(angle) * 0.34,
+      node.position.y - 0.1 + Math.sin(i) * 0.05,
+      node.position.z + Math.sin(angle) * 0.24,
+    );
     const scale = item.stage === 'egg' ? 0.075 : item.stage === 'larva' ? 0.105 : 0.13;
     mesh.scale.set(scale, scale * (item.stage === 'egg' ? 1.35 : 0.72), scale * 0.82);
     mesh.material.color.setHex(item.stage === 'egg' ? 0xeee2c6 : item.stage === 'larva' ? 0xd9c59f : 0xb99b78);
     mesh.visible = true;
   }
-  for (let i = visibleBrood; i < architecture.broodPool.length; i++) architecture.broodPool[i].visible = false;
-  if (architecture.queenSprite) architecture.queenSprite.visible = colony.queen?.alive !== false;
+  for (let i = visibleBrood; i < presentation.broodPool.length; i++) presentation.broodPool[i].visible = false;
+  if (presentation.queenSprite) presentation.queenSprite.visible = colony.queen?.alive !== false;
+}
+
+function releaseColonyNestPresentation(architecture) {
+  const presentation = colonyNestPresentations.get(architecture.colonyId);
+  if (!presentation || presentation.released) return;
+  presentation.workerPool.forEach((sprite) => sprite.material.dispose());
+  presentation.broodPool.forEach((mesh) => {
+    mesh.geometry.dispose();
+    mesh.material.dispose();
+  });
+  presentation.queenSprite?.material?.dispose();
+  presentation.presenter.release();
+  presentation.released = true;
 }
 
 function updateColonyArchitectures(dt) {
   const totalStartedAt = profiler.clock();
   let presentationMs = 0;
+  const presentingUnderground = viewState.undergroundBlend > 0.035 || cameraRig.desiredPitch < -0.1;
   for (const architecture of colonyNestArchitectures.values()) {
     const colony = getColony(architecture.colonyId);
-    if (!colony || colony.status === 'extinct') { architecture.group.visible = false; continue; }
+    if (!colony || colony.status === 'extinct') {
+      releaseColonyNestPresentation(architecture);
+      continue;
+    }
     const pressure = architecturePressure(architecture, colony);
-    let activeEdge = architecture.edges.find((edge) => !edge.completed) || null;
+    let activeEdge = nestEdges(architecture).find((edge) => !edge.completed) || null;
     const canExpand = colony.status === 'mature' || colony.status === 'young' || colony.status === 'established';
     const interval = colony.status === 'mature' ? 9 : 14;
-    if (!activeEdge && canExpand && architecture.nodes.length < 50
+    if (!activeEdge && canExpand && architecture.nodes.size < 50
       && simTime - architecture.lastGrowthAt > interval && architecture.growthDrive > 0.64) {
       activeEdge = startArchitectureProject(architecture, colony, pressure);
     }
     if (activeEdge) {
-      const desired = clamp(Math.ceil(pressure.workers.length * (colony.status === 'mature' ? 0.038 : 0.09)), 1, 12);
-      const candidates = pressure.workers
+      const livingWorkers = colony.workers.filter((worker) => worker.alive !== false);
+      const desired = clamp(Math.ceil(pressure.workerCount * (colony.status === 'mature' ? 0.038 : 0.09)), 1, 12);
+      const candidates = livingWorkers
         .filter((worker) => !worker.carrying && !worker.transferCargo && !worker.sanitationCargo)
         .sort((a, b) => Number(Boolean(b.insideNest)) - Number(Boolean(a.insideNest))
           || Number((b.assignedRole || b.role) === 'excavator') - Number((a.assignedRole || a.role) === 'excavator')
           || (b.energy || 50) - (a.energy || 50));
-      activeEdge.activeDiggers = candidates.slice(0, desired);
-      const labor = activeEdge.activeDiggers.reduce((sum, worker) => sum
+      const activeDiggers = candidates.slice(0, desired);
+      activeEdge.activeDiggerIds = activeDiggers.map((worker) => workerDisplayId(worker));
+      const labor = activeDiggers.reduce((sum, worker) => sum
         + (worker.genome?.speed || 1) * (worker.genome?.size || 1) * (0.58 + (worker.energy || 50) * 0.004), 0);
       const foodFactor = clamp((colony.storedFood - 2) / 28, colony.status === 'mature' ? 0.16 : 0.3, 1);
       const seasonFactor = environment.season.name === 'winter' ? 0.46 : environment.season.name === 'autumn' ? 0.82 : 1;
       const work = dt * labor * foodFactor * seasonFactor;
-      activeEdge.work = Math.min(activeEdge.workRequired, activeEdge.work + work);
-      activeEdge.progress = clamp(activeEdge.work / activeEdge.workRequired, 0.012, 1);
+      const nextWork = Math.min(activeEdge.workRequired, activeEdge.work + work);
+      updateNestEdgeProgress(architecture, activeEdge, clamp(nextWork / activeEdge.workRequired, 0.012, 1), { work: nextWork });
       architecture.totalExcavated += work;
-      for (const worker of activeEdge.activeDiggers) worker.architectureAssignment = activeEdge.id;
+      for (const worker of activeDiggers) worker.architectureAssignment = activeEdge.id;
       if (activeEdge.progress >= 1) {
-        activeEdge.completed = true;
-        activeEdge.activeDiggers.forEach((worker) => { worker.architectureAssignment = null; });
-        activeEdge.activeDiggers = [];
+        activeDiggers.forEach((worker) => { worker.architectureAssignment = null; });
+        activeEdge.activeDiggerIds = [];
         const node = architectureNodeById(architecture, activeEdge.toNodeId);
         if (node) node.completed = true;
+        markNestGraphChanged(architecture);
         architecture.completedProjects++;
         architecture.lastGrowthAt = simTime;
         depositArchitectureSpoil(architecture, colony);
         createSignal(colony.nest.x, colony.nest.y, architecture.color);
       }
     }
-    advanceArchitectureCirculation(architecture, colony, dt, activeEdge?.activeDiggers || []);
+    advanceArchitectureCirculation(architecture, colony, dt, architectureAssignedDiggers(colony, activeEdge));
     colony.undergroundFocusY = Math.max(-9.2, chamberDepth(architecture) * 0.72);
     colony.undergroundDistance = architecture.founding
-      ? clamp(4.45 + architecture.nodes.length * 0.34, 5.35, 9.4)
-      : clamp(6.8 + (architecture.baseChambers + architecture.nodes.length) * 0.72, 7.2, 14.5);
+      ? clamp(4.45 + architecture.nodes.size * 0.34, 5.35, 9.4)
+      : clamp(6.8 + (architecture.baseChambers + architecture.nodes.size) * 0.72, 7.2, 14.5);
     if (cameraRig.focusedColonyId === colony.id && cameraRig.desiredPitch < -0.1) {
-      const centroid = architecture.nodes.reduce((sum, node) => sum.add(node.position), new THREE.Vector3())
-        .multiplyScalar(1 / Math.max(1, architecture.nodes.length));
+      const nodes = nestNodes(architecture);
+      const centroid = nodes.reduce((sum, node) => sum.add(new THREE.Vector3(node.position.x, node.position.y, node.position.z)), new THREE.Vector3())
+        .multiplyScalar(1 / Math.max(1, nodes.length));
       const follow = Math.min(1, dt * 0.9);
       cameraRig.target.x += (centroid.x - cameraRig.target.x) * follow;
       cameraRig.target.z += (centroid.z - cameraRig.target.z) * follow;
       cameraRig.desiredDistance += (colony.undergroundDistance - cameraRig.desiredDistance) * follow;
     }
-    const presentationStartedAt = profiler.clock();
-    updateArchitectureVisual(architecture, colony);
-    presentationMs += profiler.clock() - presentationStartedAt;
+    const nestPresentation = colonyNestPresentations.get(architecture.colonyId);
+    const shouldPresent = presentingUnderground && cameraRig.focusedColonyId === architecture.colonyId;
+    if (nestPresentation && !nestPresentation.released) nestPresentation.presenter.group.visible = shouldPresent;
+    if (shouldPresent) {
+      const presentationStartedAt = profiler.clock();
+      updateArchitectureVisual(architecture, colony);
+      presentationMs += profiler.clock() - presentationStartedAt;
+    }
   }
   const totalMs = profiler.clock() - totalStartedAt;
   profiler.record('architecturePresentation', presentationMs);
@@ -2670,7 +2772,7 @@ const undergroundFoodPool = Array.from({ length: 48 }, () => {
   return food;
 });
 
-const nurseryCenter = tunnelSegments[1].curve.getPointAt(1).clone();
+const nurseryCenter = homeNestCurve(1).getPointAt(1).clone();
 const queenMaterial = new THREE.SpriteMaterial({
   map: antMaterials[1].map,
   color: 0x8e392d,
@@ -2773,48 +2875,44 @@ function representativeWorkerSample(workers, limit, priority = null) {
 }
 
 function updateUnderground() {
-  homeNestScanGroup.visible = cameraRig.focusedColonyId === HOME_COLONY_ID;
-  rivalNestScanGroup.visible = cameraRig.focusedColonyId === RIVAL_COLONY_ID;
-  homeGranaryVisual.count = Math.min(homeGranaryVisual.instanceMatrix.count, Math.floor(homeSeedBank.current));
-  rivalGranaryVisual.count = Math.min(rivalGranaryVisual.instanceMatrix.count, Math.floor(rivalSeedBank.current));
-  const tipPosition = new THREE.Vector3();
-  const active = [];
-  for (let segmentIndex = 0; segmentIndex < tunnelSegments.length; segmentIndex++) {
-    const segment = tunnelSegments[segmentIndex];
-    const progress = segment.progress;
-    const indexCount = segment.geometry.index.count;
-    const revealed = Math.floor((indexCount * progress) / 6) * 6;
-    segment.geometry.setDrawRange(0, revealed);
-
-    const chamberProgress = clamp((progress - 0.78) / 0.22, 0, 1);
-    const eased = chamberProgress * chamberProgress * (3 - chamberProgress * 2);
-    segment.chamber.visible = chamberProgress > 0.001;
-    segment.chamber.scale.copy(segment.chamberScale).multiplyScalar(Math.max(0.001, eased));
-
-    segment.tip.visible = segmentIndex >= 4 && segment.available && progress < 0.995;
-    segment.face.visible = segment.tip.visible;
-    if (segment.tip.visible) {
-      const frontT = Math.max(0.012, progress);
-      segment.curve.getPointAt(frontT, segment.tip.position);
-      segment.face.position.copy(segment.tip.position);
-      const frontTangent = segment.curve.getTangentAt(frontT).normalize();
-      segment.face.quaternion.setFromUnitVectors(Z_AXIS, frontTangent);
-      segment.face.rotateZ(segmentIndex * 0.73);
-      const pulse = segment.activeDiggers > 0
-        ? 0.78 + Math.sin(simTime * 5.2 + segment.start) * 0.22
-        : 0.62 + Math.sin(simTime * 1.4 + segment.start) * 0.06;
-      segment.tip.scale.setScalar(pulse * 0.34);
-      segment.tip.position.addScaledVector(frontTangent, 0.018);
-      if (segment.activeDiggers > 0) active.push(segment);
-    }
+  const presentingUnderground = viewState.undergroundBlend > 0.035 || cameraRig.desiredPitch < -0.1;
+  const focusedColonyId = cameraRig.focusedColonyId;
+  homeNestScanGroup.visible = presentingUnderground && focusedColonyId === HOME_COLONY_ID;
+  rivalNestScanGroup.visible = presentingUnderground && focusedColonyId === RIVAL_COLONY_ID;
+  if (!presentingUnderground) {
+    adaptiveVisualState.renderedUndergroundWorkers = 0;
+    return;
   }
+  if (focusedColonyId === RIVAL_COLONY_ID) {
+    rivalNestPresenter.syncGraph(rivalNestGraph, { visible: true, simTime });
+    rivalGranaryVisual.count = Math.min(rivalGranaryVisual.instanceMatrix.count, Math.floor(rivalSeedBank.current));
+    updateRivalUndergroundVisuals();
+    adaptiveVisualState.renderedUndergroundWorkers = rivalTransferPool
+      .reduce((count, sprite) => count + Number(sprite.visible), 0);
+    return;
+  }
+  if (focusedColonyId !== HOME_COLONY_ID) {
+    adaptiveVisualState.renderedUndergroundWorkers = 0;
+    return;
+  }
+  const active = tunnelSegments.filter((segment, segmentIndex) => (
+    segmentIndex >= 4 && segment.available && segment.progress < 0.995 && segment.activeDiggers > 0
+  ));
+  homeNestPresenter.syncGraph(homeNestGraph, {
+    visible: cameraRig.focusedColonyId === HOME_COLONY_ID,
+    simTime,
+    frontFilter: (segment) => tunnelSegments.indexOf(segment) >= 4 && segment.available && segment.progress < 0.995,
+    activeFrontIds: active.map((segment) => segment.id),
+  });
+  homeGranaryVisual.count = Math.min(homeGranaryVisual.instanceMatrix.count, Math.floor(homeSeedBank.current));
+  const tipPosition = new THREE.Vector3();
 
   digMotes.visible = active.length > 0;
   if (active.length > 0) {
     const positions = digMoteGeometry.attributes.position.array;
     for (let i = 0; i < digMoteCount; i++) {
       const segment = active[i % active.length];
-      segment.curve.getPointAt(segment.progress, tipPosition);
+      homeNestCurve(segment).getPointAt(segment.progress, tipPosition);
       const angle = i * 2.399 + simTime * (0.35 + (i % 5) * 0.05);
       const radius = 0.08 + ((i * 17) % 19) * 0.018;
       positions[i * 3] = tipPosition.x + Math.cos(angle) * radius;
@@ -2841,7 +2939,7 @@ function updateUnderground() {
     sprite.scale.set(size, size, 1);
     sprite.material.rotation = -ant.nestHeading + Math.PI * 0.5;
     sprite.material.color.setHex(ant === selectedAnt ? 0xffc66e : 0x6f2d24);
-    sprite.userData.antId = ant.id;
+    sprite.userData.workerUid = ant.runtimeUid || workerRuntimeUid(ant.colonyId, ant.id);
     sprite.visible = true;
     if (ant.soilCargo && visibleSoilLoads < undergroundSoilPool.length) {
       const pellet = undergroundSoilPool[visibleSoilLoads++];
@@ -2865,7 +2963,6 @@ function updateUnderground() {
   adaptiveVisualState.renderedUndergroundWorkers = visibleNestAnts;
   updateBiologicalVisuals();
   updateEntranceVisuals();
-  updateRivalUndergroundVisuals();
 }
 
 const ants = [];
@@ -3131,7 +3228,7 @@ function killColonyQueen(colony, cause = 'natural senescence') {
   life.queenDeathAgeYears = colonyAgeYears(colony);
   life.queenDeathCause = cause;
   life.orphanedAt = simTime;
-  life.workersAtQueenDeath = colony.workers.filter((worker) => worker.alive !== false).length;
+  life.workersAtQueenDeath = workerCensus.colonyCount(colony.id);
   life.territoryState = 'contracting';
   colony.status = 'orphaned';
   regionalLifeHistory.queenDeaths++;
@@ -3215,7 +3312,7 @@ function updateTerritoryVacancyVisuals() {
   }
 }
 
-function updateColonyLifeHistories() {
+function updateColonyLifeHistories({ refreshSummary = false } = {}) {
   for (const colony of colonyRegistry.values()) {
     const life = initializeColonyLifeHistory(colony);
     const ageYears = colonyAgeYears(colony);
@@ -3236,7 +3333,7 @@ function updateColonyLifeHistories() {
         regionalLifeHistory.reproductiveMaturities++;
         recordColonyLifeEvent('colony-reproductive-maturity', colony, {
           ageYears: Number(ageYears.toFixed(2)),
-          workers: colony.workers.filter((worker) => worker.alive !== false).length,
+          workers: workerCensus.colonyCount(colony.id),
           label: `${colony.displayName} reached reproductive maturity`,
         });
       } else if (ageYears < life.reproductiveMaturityAgeYears) {
@@ -3256,7 +3353,7 @@ function updateColonyLifeHistories() {
     }
 
     if (life.lifeStage !== 'orphaned') life.lifeStage = 'orphaned';
-    const livingWorkers = colony.workers.filter((worker) => worker.alive !== false).length;
+    const livingWorkers = workerCensus.colonyCount(colony.id);
     const orphanYears = Math.max(0, simTime - (life.orphanedAt || simTime)) / ECOLOGICAL_YEAR_SECONDS;
     const vacancy = regionalLifeHistory.vacancies.find((item) => item.id === life.vacancyId);
     const workforceReleased = livingWorkers <= Math.max(8, Math.round((life.workersAtQueenDeath || 0) * 0.45));
@@ -3290,9 +3387,13 @@ function updateColonyLifeHistories() {
       });
     }
   }
+  // The year boundary check is O(1) and remains fixed-step so the census is
+  // stamped at the same biological instant; DOM and vacancy presentation are 4 Hz.
   recordRegionalCensus();
-  updateTerritoryVacancyVisuals();
-  renderRegionalCensus();
+  if (refreshSummary) {
+    updateTerritoryVacancyVisuals();
+    renderRegionalCensus();
+  }
 }
 
 function flightLightLevel() {
@@ -3651,6 +3752,8 @@ function createNanitic(queen, broodItem) {
   };
   ensureWorkerNavigation(worker, false);
   queen.nanitics.push(worker);
+  const registeredColony = getColony(worker.colonyId);
+  if (registeredColony) indexWorker(worker, registeredColony);
   queen.workersEclosed++;
   recordLineageEvent(queen.workersEclosed === 1 ? 'first-nanitic-eclosed' : 'worker-eclosed', queen, {
     workerId: worker.id, generation: worker.generation, caste: worker.workerCaste,
@@ -3679,6 +3782,8 @@ function registerFoundingColony(queen) {
     lineageId: queen.lineageId,
     displayName: `Foundress ${queen.id.slice(-3)} colony`,
     workerPrefix: `F${queen.id.slice(-3)}-`,
+    workerRuntimePolicy: 'descendant',
+    workerPresentation: { palette: queen.natalColonyId === RIVAL_COLONY_ID ? 'slate-descendant' : 'amber-descendant' },
     speciesProfile: SPECIES_PROFILE,
     status: 'incipient',
     ageAtStartYears: 0,
@@ -3706,6 +3811,7 @@ function registerFoundingColony(queen) {
     get workersEclosed() { return queen.workersEclosed; },
     get deaths() { return queen.foundingDeaths; },
   });
+  for (const worker of record.workers) indexWorker(worker, record);
   initializeColonyLifeHistory(record);
   completeTerritoryReplacement(queen, record);
   queen.foundingStage = 'incipient';
@@ -3789,9 +3895,7 @@ function chooseYoungColonyFood(worker) {
   return best;
 }
 
-function updateYoungWorker(queen, worker, dt) {
-  worker.phase += dt * 7.8;
-  worker.ageDays += dt * SIM_DAYS_PER_SECOND;
+function updateDescendantWorkerPolicy(queen, worker, dt) {
   if (worker.insideNest) {
     worker.nestTimer -= dt;
     worker.energy = Math.min(100, worker.energy + dt * (queen.colonyFood > 0 ? 0.72 : 0.18));
@@ -3869,11 +3973,7 @@ function updateYoungWorker(queen, worker, dt) {
           queen.firstDeliveryRecorded = true;
           recordLineageEvent('first-food-delivery', queen, { workerId: worker.id, kind: worker.carryingKind });
         }
-        worker.carrying = false;
-        worker.carryingKind = null;
-        worker.carryingNutrition = 1;
-        worker.carryingSeedSpecies = null;
-        worker.carryingSourcePlantId = null;
+        clearWorkerFoodCargo(worker);
         worker.trips++;
         worker.tasksCompleted++;
       }
@@ -3904,11 +4004,7 @@ function updateYoungWorker(queen, worker, dt) {
         advanceForagingSearch(worker, network, sector, dt);
       }
       if (distance < 0.42 && worker.targetFood.amount > 0) {
-        worker.carrying = true;
-        worker.carryingKind = worker.targetFood.kind;
-        worker.carryingNutrition = worker.targetFood.nutrition;
-        worker.carryingSeedSpecies = worker.targetFood.seedSpecies;
-        worker.carryingSourcePlantId = worker.targetFood.sourcePlantId;
+        loadWorkerFoodCargo(worker, worker.targetFood);
         recordFoodDiscovery(worker, worker.targetFood);
         removeFoodUnits(worker.targetFood, 1, 'ant harvest');
       }
@@ -3940,9 +4036,7 @@ function updateYoungWorker(queen, worker, dt) {
   }
 }
 
-function markYoungWorkerDead(queen, worker, cause) {
-  if (!worker.alive) return;
-  worker.alive = false;
+function recordDescendantWorkerDeath(queen, worker, cause) {
   queen.workerDeaths++;
   queen.foundingDeaths++;
   recordLineageEvent('young-worker-died', queen, { workerId: worker.id, cause, caste: worker.workerCaste });
@@ -3958,8 +4052,8 @@ function collapseYoungColony(queen, cause) {
   queen.foundingStage = 'collapsed';
   queen.state = `young colony collapsed · ${cause}`;
   queen.foundingBrood.length = 0;
-  for (const worker of queen.nanitics) markYoungWorkerDead(queen, worker, 'colony collapse');
-  queen.nanitics.length = 0;
+  for (const worker of queen.nanitics) markRegisteredWorkerDead(worker, 'colony collapse');
+  if (colony) removeDeadRegisteredWorkers(colony);
   if (colony) {
     colony.status = 'extinct';
     colony.lifeHistory.lifeStage = 'extinct';
@@ -3993,7 +4087,7 @@ function updateYoungColony(queen, dt, queenMayLay = true) {
   let demographics = demographicStateFor(colony, careRatio);
   if (colony) colony.demographics = demographics;
   for (const worker of queen.nanitics) {
-    updateYoungWorker(queen, worker, dt);
+    updateWorker(workerWorld, colony, worker, dt);
     worker.health -= dt * demographics.starvationPressure * 0.082;
     worker.health -= dt * demographics.crowdingPressure * 0.014;
   }
@@ -4003,9 +4097,9 @@ function updateYoungColony(queen, dt, queenMayLay = true) {
     const cause = youngColonyStressTest ? 'controlled resource collapse'
       : demographics.starvationPressure > 0.45 ? 'starvation'
         : demographics.crowdingPressure > 0.6 ? 'crowding stress' : 'age';
-    markYoungWorkerDead(queen, worker, cause);
-    queen.nanitics.splice(i, 1);
+    markRegisteredWorkerDead(worker, cause);
   }
+  if (colony) removeDeadRegisteredWorkers(colony);
 
   queen.layClock -= dt;
   demographics = demographicStateFor(colony, careRatio);
@@ -4336,7 +4430,7 @@ function antNestRoute(ant) {
 function setNestPosition(ant) {
   const route = antNestRoute(ant);
   const leg = route.legs[ant.nestLeg];
-  placeAntOnNestCurve(ant, tunnelSegments[leg.segmentIndex].curve, ant.nestT);
+  placeAntOnNestCurve(ant, homeNestCurve(leg.segmentIndex), ant.nestT);
 }
 
 function placeAntOnNestCurve(ant, curve, t) {
@@ -4462,6 +4556,11 @@ function spawnAnt(initialPopulation = false, options = {}) {
   ensureWorkerNavigation(ant, initialPopulation);
   ant.assignedRole = ant.tendency;
   ants.push(ant);
+  const registeredColony = getColony(HOME_COLONY_ID);
+  if (registeredColony) {
+    indexWorker(ant, registeredColony);
+    surfaceWorkersNeedingRefresh.add(ant);
+  }
   if (options.newborn) {
     ant.tendency = 'nurse';
     ant.assignedRole = 'nurse';
@@ -4501,6 +4600,7 @@ const colonySurvival = {
   outbreakClock: 34,
 };
 const remains = [];
+const remainsSpatialIndex = createSpatialHash({ cellSize: 2 });
 
 function leaveWorkerRemains(ant) {
   if (ant.insideNest || remains.length >= 28) return;
@@ -4513,13 +4613,12 @@ function leaveWorkerRemains(ant) {
   mesh.rotation.y = -ant.heading - Math.PI / 2;
   mesh.scale.setScalar(ant.size * 0.82);
   surfaceGroup.add(mesh);
-  remains.push({ mesh, life: 48, x: ant.x, z: ant.z, colonyId: ant.colonyId || HOME_COLONY_ID });
+  const remain = { mesh, life: 48, x: ant.x, z: ant.z, colonyId: ant.colonyId || HOME_COLONY_ID };
+  remains.push(remain);
+  remainsSpatialIndex.add(remain);
 }
 
-function markWorkerDead(ant, cause) {
-  if (!ant.alive) return;
-  ant.alive = false;
-  ant.deathCause = cause;
+function recordAmberWorkerDeath(ant, cause) {
   colonySurvival.deaths++;
   if (cause === 'predation') colonySurvival.predatorDeaths++;
   else if (cause === 'disease') colonySurvival.diseaseDeaths++;
@@ -4527,10 +4626,6 @@ function markWorkerDead(ant, cause) {
   else if (cause === 'rival conflict') colonySurvival.conflictDeaths++;
   leaveWorkerRemains(ant);
   if (selectedAnt === ant) selectAnt(null);
-}
-
-function removeDeadWorkers() {
-  for (let i = ants.length - 1; i >= 0; i--) if (!ants[i].alive) ants.splice(i, 1);
 }
 
 function startPredatorVisit(forcedNearNest = false) {
@@ -4585,14 +4680,13 @@ function updatePredator(dt) {
     alignToGround(predatorMesh, predator.x, predator.z, -predator.heading - Math.PI / 2, 0.12);
     return;
   }
-  let target = ants.find((ant) => ant.id === predator.targetId && ant.alive && !ant.insideNest);
+  let target = predator.targetId == null ? null
+    : workerLookup.resolveRuntimeUid(workerRuntimeUid(HOME_COLONY_ID, predator.targetId));
+  if (target && (!target.alive || target.insideNest)) target = null;
   if (!target) {
-    let best = Infinity;
-    for (const ant of ants) {
-      if (ant.insideNest || !ant.alive) continue;
-      const distance = (ant.x - predator.x) ** 2 + (ant.z - predator.z) ** 2;
-      if (distance < best) { best = distance; target = ant; }
-    }
+    target = nearestSurfaceWorkerAt(predator.x, predator.z, Math.hypot(WORLD_W, WORLD_D), {
+      accept: (worker) => worker.colonyId === HOME_COLONY_ID,
+    });
     predator.targetId = target?.id || null;
   }
   if (target) {
@@ -4607,7 +4701,7 @@ function updatePredator(dt) {
       target.state = 'injured by hunting beetle';
       predator.attackCooldown = 1.25;
       if (target.health <= 0) {
-        markWorkerDead(target, 'predation');
+        markRegisteredWorkerDead(target, 'predation');
         predator.kills++;
         if (predator.kills % 3 === 0) predator.feedTimer = 6.5;
         predator.targetId = null;
@@ -4666,20 +4760,11 @@ function updateSpider(dt) {
   }
   spider.timer -= dt;
   spider.attackCooldown -= dt;
-  let target = null;
-  let bestDistance = Infinity;
-  for (const ant of ants) {
-    if (!ant.alive || ant.insideNest) continue;
-    if (Math.hypot(ant.x - spider.webX, ant.z - spider.webZ) > 3.25) continue;
-    const distance = Math.hypot(ant.x - spider.x, ant.z - spider.z);
-    if (distance < bestDistance) { bestDistance = distance; target = ant; }
-  }
-  for (const rival of rivalAnts) {
-    if (!rival.alive || rival.insideNest) continue;
-    if (Math.hypot(rival.x - spider.webX, rival.z - spider.webZ) > 3.25) continue;
-    const distance = Math.hypot(rival.x - spider.x, rival.z - spider.z);
-    if (distance < bestDistance) { bestDistance = distance; target = rival; }
-  }
+  const target = nearestSurfaceWorkerAt(spider.x, spider.z, Math.hypot(WORLD_W, WORLD_D), {
+    accept: (worker) => (worker.colonyId === HOME_COLONY_ID || worker.colonyId === RIVAL_COLONY_ID)
+      && Math.hypot(worker.x - spider.webX, worker.z - spider.webZ) <= 3.25,
+  });
+  const bestDistance = target ? Math.hypot(target.x - spider.x, target.z - spider.z) : Infinity;
   if (target) {
     spider.heading = Math.atan2(target.z - spider.z, target.x - spider.x);
     spider.x += Math.cos(spider.heading) * dt * 1.32;
@@ -4690,10 +4775,10 @@ function updateSpider(dt) {
       spider.attackCooldown = 1.5;
       if (target.health <= 0) {
         if (target.colonyId === RIVAL_COLONY_ID) {
-          markRivalDead(target, 'spider');
+          markRegisteredWorkerDead(target, 'spider');
           spider.rivalKills++;
         } else {
-          markWorkerDead(target, 'predation');
+          markRegisteredWorkerDead(target, 'predation');
           spider.homeKills++;
         }
         spider.kills++;
@@ -4768,7 +4853,7 @@ function updateSurvival(dt) {
       ant.health = Math.min(100, ant.health + dt * 0.018);
     }
     if (ant.health <= 0) {
-      markWorkerDead(ant, demographics.starvationPressure > 0.45 ? 'starvation'
+      markRegisteredWorkerDead(ant, demographics.starvationPressure > 0.45 ? 'starvation'
         : ant.infection > 0 ? 'disease'
           : demographics.crowdingPressure > 0.6 ? 'crowding stress' : 'age');
     }
@@ -4781,6 +4866,7 @@ function updateSurvival(dt) {
     if (remain.life <= 0) {
       surfaceGroup.remove(remain.mesh);
       remain.mesh.material.dispose();
+      remainsSpatialIndex.remove(remain);
       remains.splice(i, 1);
     }
   }
@@ -4820,10 +4906,7 @@ const rivalEntranceBiology = {
 };
 for (let i = 0; i < 4; i++) rivalEntranceBiology.cache.push({ kind: 'seed', nutrition: 1, value: 1.35 });
 
-function markRivalDead(rival, cause = 'territorial conflict') {
-  if (!rival.alive) return;
-  rival.alive = false;
-  rival.deathCause = cause;
+function recordSlateWorkerDeath(rival, cause = 'territorial conflict') {
   rivalColony.deaths++;
   if (cause === 'territorial conflict') rivalColony.rivalCasualties++;
   else if (cause === 'starvation') rivalColony.starvationDeaths++;
@@ -4883,6 +4966,8 @@ function spawnRival(newborn = false, options = {}) {
   };
   ensureWorkerNavigation(rival, !newborn);
   rivalAnts.push(rival);
+  const registeredColony = getColony(RIVAL_COLONY_ID);
+  if (registeredColony) indexWorker(rival, registeredColony);
   return rival;
 }
 
@@ -4916,6 +5001,8 @@ const homeColonyRecord = registerColony({
   lineageId: 'lineage-amber-001',
   displayName: 'Amber colony',
   workerPrefix: 'A',
+  workerRuntimePolicy: 'amber',
+  workerPresentation: { palette: 'amber' },
   speciesProfile: SPECIES_PROFILE,
   status: 'mature',
   ageAtStartYears: 7,
@@ -4947,6 +5034,9 @@ const rivalColonyRecord = registerColony({
   lineageId: 'lineage-slate-001',
   displayName: 'Slate colony',
   workerPrefix: 'S',
+  workerRuntimePolicy: 'slate',
+  workerPresentation: { palette: 'slate' },
+  encounterPolicy: { conflictColonyIds: [HOME_COLONY_ID] },
   speciesProfile: SPECIES_PROFILE,
   status: 'mature',
   ageAtStartYears: 6,
@@ -4974,7 +5064,7 @@ const rivalColonyRecord = registerColony({
 });
 
 createColonyArchitecture(homeColonyRecord, {
-  anchor: tunnelSegments[3].curve.getPointAt(1),
+  anchor: homeNestCurve(3).getPointAt(1),
   baseChambers: 4,
   baseCapacity: 150,
   baseBroodCapacity: 60,
@@ -4992,6 +5082,53 @@ createColonyArchitecture(rivalColonyRecord, {
 initializeColonyLifeHistory(homeColonyRecord);
 initializeColonyLifeHistory(rivalColonyRecord);
 
+const workerRuntime = createWorkerRuntime({
+  policies: {
+    amber: {
+      phaseDelta: (worker, dt) => dt * (8.4 * worker.speed),
+      update: (_world, _colony, worker, dt) => updateAmberWorkerPolicy(worker, dt),
+      onDeath: (_world, _colony, worker, cause) => recordAmberWorkerDeath(worker, cause),
+    },
+    slate: {
+      phaseDelta: (worker, dt) => dt * worker.speed * 8.1,
+      update: (_world, _colony, worker, dt) => updateSlateWorkerPolicy(worker, dt),
+      onDeath: (_world, _colony, worker, cause) => recordSlateWorkerDeath(worker, cause),
+    },
+    descendant: {
+      phaseDelta: (_worker, dt) => dt * 7.8,
+      update: (_world, colony, worker, dt) => updateDescendantWorkerPolicy(colony.queen, worker, dt),
+      onDeath: (_world, colony, worker, cause) => recordDescendantWorkerDeath(colony.queen, worker, cause),
+    },
+  },
+});
+const workerWorld = {
+  simDaysPerSecond: SIM_DAYS_PER_SECOND,
+  indexWorker,
+  removeWorkerIndex,
+  nearestForeignWorker: (worker, radius) => nearestForeignSurfaceWorker(worker, radius),
+};
+
+function updateWorker(world, colony, worker, dt) {
+  return workerRuntime.updateWorker(world, colony, worker, dt);
+}
+
+function markRegisteredWorkerDead(worker, cause) {
+  const colony = colonyForWorker(worker);
+  if (!colony) return false;
+  const marked = workerRuntime.markWorkerDead(workerWorld, colony, worker, cause);
+  if (marked) {
+    workerCensus.markDead(worker, colony);
+    surfaceWorkersNeedingRefresh.add(worker);
+  }
+  return marked;
+}
+
+function removeDeadRegisteredWorkers(colony) {
+  return workerRuntime.removeDeadWorkers(colony);
+}
+
+rebuildWorkerIndex();
+
 function focusedColony() {
   return getColony(cameraRig.focusedColonyId) || homeColonyRecord;
 }
@@ -5002,8 +5139,11 @@ function focusCameraOnColony(colony, underground = true) {
   const architecture = colony.architecture;
   const useArchitectureFocus = architecture && (underground || cameraRig.desiredPitch < -0.1);
   if (useArchitectureFocus) {
-    const focusNodes = architecture.nodes;
-    const centroid = focusNodes.reduce((sum, node) => sum.add(node.position), new THREE.Vector3()).multiplyScalar(1 / Math.max(1, focusNodes.length));
+    const focusNodes = nestNodes(architecture);
+    const centroid = focusNodes.reduce(
+      (sum, node) => sum.add(new THREE.Vector3(node.position.x, node.position.y, node.position.z)),
+      new THREE.Vector3(),
+    ).multiplyScalar(1 / Math.max(1, focusNodes.length));
     cameraRig.target.x = centroid.x;
     cameraRig.target.z = centroid.z;
     if (architecture.founding && underground) cameraRig.yaw = 1.22;
@@ -5040,20 +5180,16 @@ function moveRival(rival, dt, speedFactor = 1) {
 }
 
 function nearestRivalFood(rival, pickupDistance = 0.58) {
-  let found = null;
-  let best = pickupDistance * pickupDistance;
-  for (const food of foods) {
-    if (food.amount <= 0) continue;
-    const distance = (food.x - rival.x) ** 2 + (food.z - rival.z) ** 2;
-    if (distance < best) { best = distance; found = food; }
-  }
-  return found;
+  return foodSpatialIndex.nearest(
+    rival.x,
+    rival.z,
+    pickupDistance,
+    (food) => food.amount > 0,
+  )?.entity || null;
 }
 
-function updateRivalAnt(rival, dt) {
+function updateSlateWorkerPolicy(rival, dt) {
   if (!rival.alive) return;
-  rival.phase += dt * rival.speed * 8.1;
-  rival.ageDays += dt * SIM_DAYS_PER_SECOND;
   rival.turnClock -= dt;
   rival.fightCooldown -= dt;
 
@@ -5120,13 +5256,11 @@ function updateRivalAnt(rival, dt) {
     }
   }
 
-  let opponent = null;
-  let opponentDistance = 1.15;
-  for (const ant of ants) {
-    if (!ant.alive || ant.insideNest) continue;
-    const distance = Math.hypot(ant.x - rival.x, ant.z - rival.z);
-    if (distance < opponentDistance) { opponentDistance = distance; opponent = ant; }
-  }
+  const conflictColonyIds = rivalColonyRecord.encounterPolicy?.conflictColonyIds || [];
+  const opponent = nearestForeignSurfaceWorker(rival, 1.15, {
+    accept: (worker) => conflictColonyIds.includes(worker.colonyId),
+  });
+  const opponentDistance = opponent ? Math.hypot(opponent.x - rival.x, opponent.z - rival.z) : 1.15;
   if (opponent) {
     const toward = Math.atan2(opponent.z - rival.z, opponent.x - rival.x);
     const shouldFight = rival.role === 'guard' || rival.health > 54;
@@ -5147,11 +5281,11 @@ function updateRivalAnt(rival, dt) {
       rivalColony.clashes++;
       createSignal((rival.x + opponent.x) * 0.5, (rival.z + opponent.z) * 0.5, 0xb85d51);
       if (opponent.health <= 0) {
-        markWorkerDead(opponent, 'rival conflict');
+        markRegisteredWorkerDead(opponent, 'rival conflict');
         rivalColony.ourCasualties++;
       }
       if (rival.health <= 0) {
-        markRivalDead(rival, 'territorial conflict');
+        markRegisteredWorkerDead(rival, 'territorial conflict');
       }
     }
     moveRival(rival, dt, shouldFight ? 1.08 : 1.3);
@@ -5194,6 +5328,9 @@ function updateRivalAnt(rival, dt) {
     rivalPherDeposit(rival.x, rival.z, 0.027);
     if (homeDistance < 0.72) {
       if (rivalEntranceBiology.cache.length < rivalEntranceBiology.capacity) {
+        // This is a rare delivery event rather than a per-worker encounter
+        // query. Preserve its sequential, current-position semantics exactly;
+        // the hot per-Slate opponent lookup remains spatially indexed.
         const nearby = rivalAnts.filter((worker) => worker !== rival && !worker.insideNest && !worker.carrying
           && Math.hypot(worker.x - RIVAL_NEST.x, worker.z - RIVAL_NEST.y) < 1.35).length;
         recordForagingDelivery(rival);
@@ -5209,11 +5346,7 @@ function updateRivalAnt(rival, dt) {
         rivalEntranceBiology.contactEvents += nearby;
         rivalEntranceBiology.recentReturns = Math.min(1, rivalEntranceBiology.recentReturns + 0.2);
         rivalEntranceBiology.activation = Math.min(1, rivalEntranceBiology.activation + 0.11 + rival.carryingNutrition * 0.05 + Math.min(0.14, nearby * 0.012));
-        rival.carrying = false;
-        rival.carryingKind = null;
-        rival.carryingNutrition = 1;
-        rival.carryingSeedSpecies = null;
-        rival.carryingSourcePlantId = null;
+        clearWorkerFoodCargo(rival);
         rival.tasksCompleted++;
         rival.trips++;
         rival.targetFood = null;
@@ -5239,11 +5372,7 @@ function updateRivalAnt(rival, dt) {
     && (rivalColonyRecord.demographics?.reserveRatio || 0) < 1.1;
   const pickup = rival.role === 'forager' || scoutCanCollect ? nearestRivalFood(rival) : null;
   if (pickup) {
-    rival.carrying = true;
-    rival.carryingNutrition = pickup.nutrition;
-    rival.carryingKind = pickup.kind;
-    rival.carryingSeedSpecies = pickup.seedSpecies;
-    rival.carryingSourcePlantId = pickup.sourcePlantId;
+    loadWorkerFoodCargo(rival, pickup);
     rival.targetFood = pickup;
     recordFoodDiscovery(rival, pickup);
     removeFoodUnits(pickup, 1, 'ant harvest');
@@ -5468,13 +5597,13 @@ function updateRivalColony(dt) {
     rival.health -= dt * demographics.crowdingPressure * 0.011;
     if (rival.insideNest && demographics.reserveRatio > 0.6) rival.health = Math.min(100, rival.health + dt * 0.014);
     if (rival.health <= 0) {
-      markRivalDead(rival, demographics.starvationPressure > 0.45 ? 'starvation'
+      markRegisteredWorkerDead(rival, demographics.starvationPressure > 0.45 ? 'starvation'
         : demographics.crowdingPressure > 0.6 ? 'crowding stress' : 'age');
       continue;
     }
-    updateRivalAnt(rival, dt);
+    updateWorker(workerWorld, rivalColonyRecord, rival, dt);
   }
-  for (let i = rivalAnts.length - 1; i >= 0; i--) if (!rivalAnts[i].alive) rivalAnts.splice(i, 1);
+  removeDeadRegisteredWorkers(rivalColonyRecord);
 }
 
 function updateColonyBiology(dt) {
@@ -5618,11 +5747,7 @@ function depositInEntranceCache(ant) {
   entranceBiology.activation = Math.min(1, entranceBiology.activation + 0.1 + nutrition * 0.055 + Math.min(0.16, waiting * 0.018));
   entranceBiology.contactEvents += waiting;
   ant.pendingDelivery = false;
-  ant.carrying = false;
-  ant.carryingKind = null;
-  ant.carryingNutrition = 1;
-  ant.carryingSeedSpecies = null;
-  ant.carryingSourcePlantId = null;
+  clearWorkerFoodCargo(ant);
   ant.tasksCompleted++;
   ant.taskExperience.forager += 1;
   ant.nestTimer = Math.max(ant.nestTimer, rand(1.4, 2.8));
@@ -5742,7 +5867,16 @@ const obstacles = [
 
 const surfaceWorkerGrid = new Map();
 let indexedSurfaceWorkers = [];
-const surfaceWorkerIndices = new WeakMap();
+let surfaceWorkerIndices = new WeakMap();
+let surfaceWorkerCellKeys = new WeakMap();
+let surfaceWorkerOrders = new WeakMap();
+const SURFACE_WORKER_COLONY_ORDER_STRIDE = 1_000_000;
+
+function canonicalSurfaceWorkerOrder(worker) {
+  const colonyRank = Math.max(0, colonyOrder.indexOf(worker?.colonyId));
+  const workerRank = Math.max(0, getColony(worker?.colonyId)?.workers.indexOf(worker) ?? 0);
+  return colonyRank * SURFACE_WORKER_COLONY_ORDER_STRIDE + workerRank;
+}
 
 function antCellCoords(x, z) {
   return {
@@ -5758,14 +5892,25 @@ function rebuildSurfaceWorkerGrid() {
   profiler.incrementFrame('surfaceIndexBuilds');
   surfaceWorkerGrid.clear();
   indexedSurfaceWorkers = [];
+  surfaceWorkerIndices = new WeakMap();
+  surfaceWorkerCellKeys = new WeakMap();
+  surfaceWorkerOrders = new WeakMap();
+  surfaceWorkersNeedingRefresh.clear();
   for (const colony of colonyRegistry.values()) {
     if (colony.status === 'extinct') continue;
-    for (const worker of colony.workers) {
+    const colonyRank = Math.max(0, colonyOrder.indexOf(colony.id));
+    for (let workerRank = 0; workerRank < colony.workers.length; workerRank++) {
+      const worker = colony.workers[workerRank];
+      surfaceWorkerOrders.set(
+        worker,
+        colonyRank * SURFACE_WORKER_COLONY_ORDER_STRIDE + workerRank,
+      );
       if (worker.alive === false || worker.insideNest) continue;
       surfaceWorkerIndices.set(worker, indexedSurfaceWorkers.length);
       indexedSurfaceWorkers.push(worker);
       const cell = antCellCoords(worker.x, worker.z);
       const key = antCellKey(cell.x, cell.z);
+      surfaceWorkerCellKeys.set(worker, key);
       let occupants = surfaceWorkerGrid.get(key);
       if (!occupants) {
         occupants = [];
@@ -5777,26 +5922,141 @@ function rebuildSurfaceWorkerGrid() {
   profiler.end('spatialIndex', profileStartedAt);
 }
 
+function detachSurfaceWorkerFromGrid(worker) {
+  const key = surfaceWorkerCellKeys.get(worker);
+  if (key == null) return false;
+  const occupants = surfaceWorkerGrid.get(key);
+  const index = occupants?.indexOf(worker) ?? -1;
+  if (index >= 0) occupants.splice(index, 1);
+  if (occupants?.length === 0) surfaceWorkerGrid.delete(key);
+  surfaceWorkerCellKeys.delete(worker);
+  return index >= 0;
+}
+
+function refreshSurfaceWorkerGrid(workers) {
+  if (!workers?.length) return;
+  const profileStartedAt = profiler.begin('spatialRefresh');
+  let cellMoves = 0;
+  for (const worker of workers) {
+    const oldKey = surfaceWorkerCellKeys.get(worker);
+    if (worker.alive === false || worker.insideNest) {
+      cellMoves += Number(detachSurfaceWorkerFromGrid(worker));
+      continue;
+    }
+    const cell = antCellCoords(worker.x, worker.z);
+    const nextKey = antCellKey(cell.x, cell.z);
+    if (oldKey === nextKey) continue;
+    if (oldKey != null) detachSurfaceWorkerFromGrid(worker);
+    let occupants = surfaceWorkerGrid.get(nextKey);
+    if (!occupants) {
+      occupants = [];
+      surfaceWorkerGrid.set(nextKey, occupants);
+    }
+    occupants.push(worker);
+    occupants.sort((a, b) => (surfaceWorkerOrders.get(a) ?? canonicalSurfaceWorkerOrder(a))
+      - (surfaceWorkerOrders.get(b) ?? canonicalSurfaceWorkerOrder(b)));
+    surfaceWorkerCellKeys.set(worker, nextKey);
+    cellMoves++;
+  }
+  profiler.incrementFrame('surfaceIndexWorkerRefreshes', workers.length);
+  profiler.incrementFrame('surfaceIndexCellMoves', cellMoves);
+  profiler.end('spatialRefresh', profileStartedAt);
+}
+
+function descendantWorkers() {
+  const workers = [];
+  for (const colony of colonyRegistry.values()) {
+    if (colony.id === HOME_COLONY_ID || colony.id === RIVAL_COLONY_ID || colony.status === 'extinct') continue;
+    workers.push(...colony.workers);
+  }
+  return workers;
+}
+
 function workersInCombatContact(a, b) {
   return a.colonyId !== b.colonyId
     && (a.combatContactUntil || 0) > simTime
     && (b.combatContactUntil || 0) > simTime;
 }
 
+function surfaceWorkersNear(worker, radius = Infinity, {
+  foreignOnly = false,
+  livingOnly = true,
+  cellSpan = null,
+  accept = null,
+} = {}) {
+  if (!worker || worker.insideNest) return [];
+  return surfaceWorkersNearPoint(worker.x, worker.z, radius, {
+    excludeWorker: worker,
+    sourceColonyId: worker.colonyId,
+    foreignOnly,
+    livingOnly,
+    cellSpan,
+    accept,
+  });
+}
+
+function surfaceWorkersNearPoint(x, z, radius = Infinity, {
+  excludeWorker = null,
+  sourceColonyId = null,
+  foreignOnly = false,
+  livingOnly = true,
+  cellSpan = null,
+  accept = null,
+} = {}) {
+  const cell = antCellCoords(x, z);
+  const span = cellSpan ?? (Number.isFinite(radius) ? Math.max(1, Math.ceil(radius / ANT_CELL_SIZE)) : 1);
+  const radiusSq = radius * radius;
+  const nearby = [];
+  for (let ox = -span; ox <= span; ox++) {
+    for (let oz = -span; oz <= span; oz++) {
+      const occupants = surfaceWorkerGrid.get(antCellKey(cell.x + ox, cell.z + oz));
+      if (!occupants) continue;
+      for (const other of occupants) {
+        if (other === excludeWorker || other.insideNest || (livingOnly && other.alive === false)) continue;
+        if (foreignOnly && other.colonyId === sourceColonyId) continue;
+        if (accept && !accept(other)) continue;
+        if (Number.isFinite(radius)) {
+          const dx = x - other.x;
+          const dz = z - other.z;
+          if (dx * dx + dz * dz > radiusSq) continue;
+        }
+        nearby.push(other);
+      }
+    }
+  }
+  return nearby;
+}
+
+function nearestSurfaceWorkerAt(x, z, radius, options = {}) {
+  let nearest = null;
+  let nearestDistanceSq = radius * radius;
+  for (const other of surfaceWorkersNearPoint(x, z, radius, options)) {
+    const distanceSq = (x - other.x) ** 2 + (z - other.z) ** 2;
+    if (distanceSq < nearestDistanceSq) {
+      nearestDistanceSq = distanceSq;
+      nearest = other;
+    }
+  }
+  return nearest;
+}
+
+function nearestForeignSurfaceWorker(worker, radius = 1.15, options = {}) {
+  return nearestSurfaceWorkerAt(worker.x, worker.z, radius, {
+    excludeWorker: worker,
+    sourceColonyId: worker.colonyId,
+    foreignOnly: true,
+    ...options,
+  });
+}
+
 function applyNeighborAvoidance(ant) {
   if (ant.insideNest) return;
-  const cell = antCellCoords(ant.x, ant.z);
   let separateX = 0;
   let separateZ = 0;
   let pressure = 0;
   let neighbors = 0;
 
-  for (let ox = -1; ox <= 1; ox++) {
-    for (let oz = -1; oz <= 1; oz++) {
-      const occupants = surfaceWorkerGrid.get(antCellKey(cell.x + ox, cell.z + oz));
-      if (!occupants) continue;
-      for (const other of occupants) {
-        if (other === ant || other.insideNest) continue;
+  for (const other of surfaceWorkersNear(ant, Infinity, { cellSpan: 1, livingOnly: false })) {
         let dx = ant.x - other.x;
         let dz = ant.z - other.z;
         let distanceSq = dx * dx + dz * dz;
@@ -5822,8 +6082,6 @@ function applyNeighborAvoidance(ant) {
         }
         pressure += strength;
         neighbors++;
-      }
-    }
   }
 
   if (neighbors > 0) {
@@ -5836,7 +6094,6 @@ function applyNeighborAvoidance(ant) {
 }
 
 function resolveSurfaceWorkerSpacing() {
-  rebuildSurfaceWorkerGrid();
   for (let i = 0; i < indexedSurfaceWorkers.length; i++) {
     const ant = indexedSurfaceWorkers[i];
     if (ant.insideNest) continue;
@@ -5878,14 +6135,12 @@ function resolveSurfaceWorkerSpacing() {
 }
 
 function nearestFood(ant, maxDist = 0.62) {
-  let found = null;
-  let best2 = maxDist * maxDist;
-  for (const food of foods) {
-    if (food.amount <= 0) continue;
-    const d2 = (food.x - ant.x) ** 2 + (food.z - ant.z) ** 2;
-    if (d2 < best2) { best2 = d2; found = food; }
-  }
-  return found;
+  return foodSpatialIndex.nearest(
+    ant.x,
+    ant.z,
+    maxDist,
+    (food) => food.amount > 0,
+  )?.entity || null;
 }
 
 function steerTowards(ant, angle, strength) {
@@ -5956,18 +6211,16 @@ function updateSanitationSurface(ant, dt) {
     return true;
   }
   if (ant.assignedRole !== 'sanitizer' || remains.length === 0) return false;
-  let target = null;
-  let targetDistance = Infinity;
-  for (const remain of remains) {
-    const distance = Math.hypot(remain.x - ant.x, remain.z - ant.z);
-    if (distance < targetDistance) { targetDistance = distance; target = remain; }
-  }
+  const nearestRemain = remainsSpatialIndex.nearest(ant.x, ant.z, Math.hypot(WORLD_W, WORLD_D));
+  const target = nearestRemain?.entity || null;
+  const targetDistance = nearestRemain ? Math.sqrt(nearestRemain.distanceSquared) : Infinity;
   if (!target) return false;
   ant.state = 'locating colony remains';
   steerTowards(ant, Math.atan2(target.z - ant.z, target.x - ant.x), 0.94);
   if (targetDistance < 0.25) {
     const index = remains.indexOf(target);
     if (index >= 0) remains.splice(index, 1);
+    remainsSpatialIndex.remove(target);
     surfaceGroup.remove(target.mesh);
     target.mesh.material.dispose();
     ant.sanitationCargo = true;
@@ -6031,8 +6284,12 @@ function updateNestAnt(ant, dt) {
     if (!segment) { ant.nestMode = 'traveling'; ant.nestDirection = -1; return; }
     segment.activeDiggers++;
     ant.nestLaneAngle += dt * (0.08 + (ant.id % 5) * 0.012);
-    placeAntOnNestCurve(ant, segment.curve, Math.max(0.012, segment.progress));
-    ant.nestHeading = Math.atan2(segment.curve.getTangentAt(Math.max(0.012, segment.progress)).z, segment.curve.getTangentAt(Math.max(0.012, segment.progress)).x);
+    const excavationCurve = homeNestCurve(segment);
+    placeAntOnNestCurve(ant, excavationCurve, Math.max(0.012, segment.progress));
+    ant.nestHeading = Math.atan2(
+      excavationCurve.getTangentAt(Math.max(0.012, segment.progress)).z,
+      excavationCurve.getTangentAt(Math.max(0.012, segment.progress)).x,
+    );
     ant.state = `excavating ${segment.name}`;
     ant.energy = Math.max(0, ant.energy - dt * 0.24);
     ant.digTimer -= dt;
@@ -6040,13 +6297,13 @@ function updateNestAnt(ant, dt) {
       const morphology = clamp(ant.size, 0.82, 1.2);
       const experience = Math.min(0.2, (ant.taskExperience.excavator || 0) * 0.018);
       const productivity = (0.7 + ant.energy * 0.004 + (ant.tendency === 'excavator' ? 0.18 : 0) + experience) * morphology;
-      segment.work = Math.min(segment.workRequired, segment.work + dt * productivity);
-      segment.progress = clamp(segment.work / segment.workRequired, 0.012, 1);
+      const nextWork = Math.min(segment.workRequired, segment.work + dt * productivity);
+      updateNestEdgeProgress(homeNestGraph, segment, clamp(nextWork / segment.workRequired, 0.012, 1), { work: nextWork });
     }
     if (ant.digTimer <= 0 || segment.progress >= 0.999 || ant.energy < 18) {
       const finalLeg = route.legs[route.legs.length - 1];
       finalLeg.to = Math.max(0.012, segment.progress);
-      finalLeg.length = Math.max(0.1, segment.curve.getLength() * finalLeg.to);
+      finalLeg.length = Math.max(0.1, excavationCurve.getLength() * finalLeg.to);
       ant.nestT = finalLeg.to;
       ant.nestLeg = route.legs.length - 1;
       ant.nestDirection = -1;
@@ -6159,7 +6416,7 @@ function updateNestAnt(ant, dt) {
   }
 
   const leg = route.legs[ant.nestLeg];
-  const curve = tunnelSegments[leg.segmentIndex].curve;
+  const curve = homeNestCurve(leg.segmentIndex);
   const before = ant.nestPosition.clone();
   const tSpeed = ant.speed * 0.84 * dt / leg.length;
   if (ant.nestDirection > 0) {
@@ -6215,13 +6472,11 @@ function updateNestAnt(ant, dt) {
   }
 }
 
-function updateAnt(ant, dt) {
+function updateAmberWorkerPolicy(ant, dt) {
   if (!ant.alive) return;
-  ant.phase += dt * (8.4 * ant.speed);
   ant.borderCooldown -= dt;
   ant.turnClock -= dt;
   ant.pause -= dt;
-  ant.ageDays += dt * SIM_DAYS_PER_SECOND;
 
   if (ant.insideNest) {
     updateNestAnt(ant, dt);
@@ -6320,11 +6575,7 @@ function updateAnt(ant, dt) {
   } else if (!learningWalkActive) {
     const food = nearestFood(ant);
     if (food) {
-      ant.carrying = true;
-      ant.carryingNutrition = food.nutrition;
-      ant.carryingKind = food.kind;
-      ant.carryingSeedSpecies = food.seedSpecies;
-      ant.carryingSourcePlantId = food.sourcePlantId;
+      loadWorkerFoodCargo(ant, food);
       ant.state = 'collecting';
       recordFoodDiscovery(ant, food);
       removeFoodUnits(food, 1, 'ant harvest');
@@ -6708,26 +6959,38 @@ function update(dt) {
     );
   }
   updateSurvival(dt);
-  updateColonyLifeHistories();
+  updateColonyLifeHistories({
+    refreshSummary: lowFrequencySchedule.due('life-history-summary', simTime, 0.25),
+  });
+  // Build before every surface-moving actor, including predators.
+  rebuildSurfaceWorkerGrid();
   updatePredator(dt);
   updateSpider(dt);
+  refreshSurfaceWorkerGrid([...surfaceWorkersNeedingRefresh]);
+  surfaceWorkersNeedingRefresh.clear();
   updateWeather(dt);
   updateVegetationEcology(dt);
   retireDepletedFoodRecords();
-  rebuildSurfaceWorkerGrid();
+  // Phase 9E spatial schedule: one canonical build before movement,
+  // bounded colony-local cell refreshes between movement groups, and one
+  // canonical build before final overlap/contact resolution.
   updateNuptialFlight(dt);
+  refreshSurfaceWorkerGrid(descendantWorkers());
   updatePheromones(dt);
   updateForagingNetworks(dt);
   updateEntranceBiology(dt);
   refreshConstructionProjects();
   updateLaborAssignments(dt);
   updateColonyBiology(dt);
-  rebuildSurfaceWorkerGrid();
+  refreshSurfaceWorkerGrid([...surfaceWorkersNeedingRefresh]);
+  surfaceWorkersNeedingRefresh.clear();
   updateRivalColony(dt);
+  refreshSurfaceWorkerGrid([...rivalAnts, ...surfaceWorkersNeedingRefresh]);
+  surfaceWorkersNeedingRefresh.clear();
   updateColonyArchitectures(dt);
+  for (const ant of ants) updateWorker(workerWorld, homeColonyRecord, ant, dt);
+  removeDeadRegisteredWorkers(homeColonyRecord);
   rebuildSurfaceWorkerGrid();
-  for (const ant of ants) updateAnt(ant, dt);
-  removeDeadWorkers();
   resolveSurfaceWorkerSpacing();
   updateAtmosphere(dt);
   updateUnderground();
@@ -6771,6 +7034,9 @@ function render() {
 let last = performance.now();
 let accumulator = 0;
 let nextDebugRefreshAt = 0;
+let droppedBacklogSeconds = 0;
+const MAX_FIXED_STEPS_PER_FRAME = 16;
+const MAX_DEFERRED_FIXED_STEPS = 4;
 
 function collectDebugState() {
   const fixtureComparison = window.fixtureComparison;
@@ -6788,6 +7054,10 @@ function collectDebugState() {
   return {
     profile: profiler.snapshot(),
     backlogMs: accumulator * 1000,
+    backlogGuard: {
+      deferredSteps: Math.max(0, Math.floor((accumulator + Number.EPSILON) / FIXED_DT)),
+      droppedMs: droppedBacklogSeconds * 1000,
+    },
     simulatedSurface: adaptiveVisualState.simulatedSurfaceWorkers,
     renderedSurface: adaptiveVisualState.renderedSurfaceWorkers,
     simulatedUnderground,
@@ -6822,8 +7092,24 @@ function frame(now) {
   const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
   last = now;
   accumulator += dt * timeScale;
-  while (accumulator >= FIXED_DT) { runFixedStep(); accumulator -= FIXED_DT; }
+  const backlogResult = drainFixedStepBacklog({
+    accumulator,
+    fixedDt: FIXED_DT,
+    maxSteps: MAX_FIXED_STEPS_PER_FRAME,
+    maxDeferredSteps: MAX_DEFERRED_FIXED_STEPS,
+    step: runFixedStep,
+  });
+  accumulator = backlogResult.accumulator;
+  droppedBacklogSeconds += backlogResult.droppedSeconds;
+  if (backlogResult.deferredSteps > 0) {
+    profiler.incrementFrame('fixedStepsDeferred', backlogResult.deferredSteps);
+  }
+  if (backlogResult.droppedSteps > 0) {
+    profiler.incrementFrame('fixedStepsDropped', backlogResult.droppedSteps);
+  }
   profiler.setGauge('updateBacklogMs', Number((accumulator * 1000).toFixed(3)));
+  profiler.setGauge('deferredFixedSteps', backlogResult.deferredSteps);
+  profiler.setGauge('droppedBacklogMs', Number((droppedBacklogSeconds * 1000).toFixed(3)));
   updateCamera(dt);
   render();
   profiler.endFrame();
@@ -6838,6 +7124,8 @@ function groundPoint(clientX, clientY) {
 }
 
 function antAtPointer(clientX, clientY) {
+  const architectureWorkerSprites = Array.from(colonyNestPresentations.values())
+    .flatMap((nestPresentation) => nestPresentation.released ? [] : nestPresentation.workerPool || []);
   return selectionPresentation.antAtPointer({
     clientX,
     clientY,
@@ -6849,8 +7137,8 @@ function antAtPointer(clientX, clientY) {
     youngWorkerInstanceLookup,
     undergroundSpritePool,
     rivalTransferPool,
-    ants,
-    rivalAnts,
+    undergroundWorkerSprites: architectureWorkerSprites,
+    resolveWorker: (uid) => workerLookup.resolveRuntimeUid(uid),
   });
 }
 
@@ -6963,8 +7251,8 @@ window.advanceTime = (ms) => {
 function findWorkerByIdentity(identity) {
   const raw = String(identity ?? '').trim();
   const normalized = raw.toUpperCase();
-  if (normalized.startsWith('S')) return rivalAnts.find((worker) => worker.id === Number(normalized.slice(1))) || null;
-  if (normalized.startsWith('A')) return ants.find((worker) => worker.id === Number(normalized.slice(1))) || null;
+  const indexed = workerLookup.resolve(raw);
+  if (indexed) return indexed;
   const byColonyUid = /^([A-Z]+)[-:]W?(\d+)$/.exec(normalized);
   if (byColonyUid) {
     const colony = getColony(byColonyUid[1].toLowerCase());
